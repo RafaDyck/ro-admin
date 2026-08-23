@@ -1,0 +1,8 @@
+# The overlay ships to a game server that is almost always Linux, and the NPC
+# script is mounted or copied straight into rAthena's npc/custom/ directory.
+# core.autocrlf=true on a Windows clone would rewrite these to CRLF on
+# checkout, putting a stray \r after `FAKE_NPC,{` and after every label.
+# Pin them to LF so the artifact an operator receives is the artifact that was
+# tested, whatever platform they cloned on.
+overlay/*.txt text eol=lf
+overlay/*.sql text eol=lf

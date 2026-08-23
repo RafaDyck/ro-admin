@@ -32,6 +32,8 @@ class Permission(StrEnum):
     CHARACTERS_READ = "characters.read"
     CHARACTERS_WRITE = "characters.write"
     SYSTEM_READ = "system.read"
+    COMMANDS_READ = "commands.read"
+    COMMANDS_WRITE = "commands.write"
 
 
 _REQUIRED: dict[Permission, Level] = {
@@ -41,6 +43,9 @@ _REQUIRED: dict[Permission, Level] = {
     Permission.CHARACTERS_READ: Level.STAFF,
     Permission.CHARACTERS_WRITE: Level.ADMIN,
     Permission.SYSTEM_READ: Level.STAFF,
+    Permission.COMMANDS_READ: Level.STAFF,
+    # Enqueueing changes the game world. Same level as any other write.
+    Permission.COMMANDS_WRITE: Level.ADMIN,
 }
 
 ALL_PERMISSIONS = tuple(_REQUIRED)

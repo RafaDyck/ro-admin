@@ -4,7 +4,15 @@ A modern administration API for [rAthena](https://github.com/rathena/rathena) se
 
 ## What this is, and is not
 
-**Is:** an administration interface — accounts, characters, forensics, live GM operations.
+**Is:** an operator's administration API — **forensics** over rAthena's own logs and **live GM
+operations** applied inside the running game server. Five routers ship today: `auth`, `logs`
+(GM commands, zeny changes, item transactions, and a per-character timeline across all three),
+`system` (capability reporting), `items` (id-to-name lookup), and `commands` (the Tier 1 queue:
+item grants and zeny adjustments).
+
+**Does not yet include:** account or character management. There is no `/accounts` or
+`/characters` endpoint, and nothing here edits a `login` or `char` row — reads go through the
+log tables, and the only writes go through the game server itself.
 
 **Is not:** a FluxCP replacement. FluxCP is two products: of its 135 actions, only 49 require
 admin. The other 64% is a player-facing control panel — registration, rankings, donations,
@@ -20,11 +28,17 @@ seams. You keep pulling upstream.
 
 | Tier | You do | You get |
 |---|---|---|
-| **0 — Database** | Point it at your MySQL. Nothing installed. | Accounts, characters, items, maps, **forensics/logs**, monitoring |
-| **1 — Script overlay** | Drop one NPC file in `npc/custom/`, uncomment one line. No recompile. | Live GM operations with no player relog |
+| **0 — Database** | Point it at your MySQL. Nothing installed. | **Forensics/logs** — GM commands, zeny, item transactions, per-character timeline — plus item lookup and a health/capability report |
+| **1 — Script overlay** *(shipping)* | Run `overlay/schema.sql`, drop one NPC file in `npc/custom/`, add one line to `scripts_custom.conf`. No recompile. | Item grants and zeny adjustments applied **inside the running game**: the game's own stacking, weight and cap rules; whatever logging the server has enabled; visible without a relog; and an outcome recorded only after the change was read back and confirmed |
 | **2 — Compiled hooks** | Add an `.inc` to `src/custom/`, rebuild. | Custom atcommands and script functions |
 
 Tier 0 is fully useful alone. Tier 2 is never required.
+
+**Tier 1 install, verification and limits: [`overlay/README.md`](overlay/README.md).**
+Read it before installing — in particular, item grants land in `picklog` on a stock
+rAthena, and zeny changes do not land in `zenylog` unless you have turned `log_zeny`
+on. `GET /api/v1/system/capabilities` reports whether Tier 1 is actually responding,
+from the script's own heartbeat rather than from a config file.
 
 ## AI, deliberately absent
 
@@ -56,6 +70,11 @@ API docs at http://localhost:8000/docs
 rAthena code, and redistributes no game data — it connects to your database
 over a normal MySQL connection and reads what is already there. Item and job
 names come from *your* `item_db` at runtime, never bundled here.
+
+Tier 1 adds two tables of its own, both prefixed `ro_admin_`, and one NPC
+script you copy into `npc/custom/` — rAthena's own extension seam. It modifies
+no rAthena file and needs no rebuild. Two `DROP TABLE`s and one line removed
+from `scripts_custom.conf` put everything back.
 
 rAthena itself is GPLv3 and is not included or modified by this project.
 

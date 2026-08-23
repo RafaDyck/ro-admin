@@ -38,3 +38,15 @@ class Database:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(sql, params or ())
             return list(cur.fetchall())
+
+    def execute(self, sql: str, params: Sequence[Any] | None = None) -> int:
+        """Run a statement that writes. Returns the inserted row id.
+
+        Same parameterization rule as query(): the caller supplies placeholders
+        and values, never a formatted string. Nothing in this codebase builds
+        SQL by concatenation, and this method exists so the write path has no
+        reason to be the exception.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(sql, params or ())
+            return int(cur.lastrowid)

@@ -1,0 +1,284 @@
+//===== ro-admin =============================================
+//= Tier 1 command overlay
+//===== Project: =============================================
+//= https://github.com/RafaDyck/ro-admin
+//===== Version: =============================================
+//= 1
+//= The version string below is written to ro_admin_overlay on
+//= every poll, and the API compares it against its own. Bump
+//= BOTH this constant and OVERLAY_VERSION in src/ro_admin/
+//= overlay.py when the queue contract changes.
+//===== Source citations: ====================================
+//= The `src/map/...` and `conf/...` line numbers in the
+//= comments below were read against rAthena at commit ad04a42
+//= (2025-08-04). Upstream moves them: rAthena is a live
+//= project and these are not stable addresses. The behaviour
+//= each one describes was verified at that revision -- if a
+//= line no longer says what the comment claims, trust the
+//= comment's claim only after re-checking it, and prefer
+//= re-deriving over assuming drift.
+//=
+//= One divergence is known and load-bearing: at ad04a42 a
+//= rejected unit inside getitem's loop returns failure, while
+//= on older trees it is dropped to the ground and the loop
+//= continues. The post-condition check below is correct for
+//= both, which is the point of checking rather than trusting.
+//===== Description: =========================================
+//= Applies queued administrative actions through the game
+//= server, so that the game's own rules apply and the server
+//= logs them to the extent it is configured to.
+//= Reads ro_admin_commands; writes ro_admin_overlay.
+//=
+//= INVARIANT: no string originating outside this file is ever
+//= concatenated into SQL. Every queued argument is an integer
+//= column, and every error_message written at L_Finish is a
+//= literal from this file containing no quote character.
+//=
+//= INVARIANT: this script is the ONLY consumer of
+//= ro_admin_commands. Rows are claimed with a compare-and-swap
+//= and stamped with .instance so that a second consumer shows
+//= up in the data instead of silently winning races.
+//=
+//= INVARIANT: a row is stamped 'executed' only after the game
+//= has been observed to do what was asked. rAthena's script
+//= engine cannot report a failed command back to the script
+//= (src/map/script.cpp:4136-4140), so every action branch
+//= re-reads the player state it just changed and compares.
+//=
+//= Enforced by tests/test_overlay_artifact.py.
+//============================================================
+
+-	script	ro_admin_overlay	FAKE_NPC,{
+OnInit:
+	// Identifies this run of the script, so that a row's claimed_by names the
+	// consumer that executed it.
+	//
+	// gettimetick(2) is the unix timestamp in SECONDS
+	// (doc/script_commands.txt:3394-3401). On its own it is too coarse: two
+	// map servers started -- or two @reloadscript runs completed -- inside
+	// the same second would share an instance id, the `claimed_by = .instance`
+	// predicate below would happily match a row the OTHER consumer claimed,
+	// and the LOST RACE branch could never fire. That would quietly void the
+	// second invariant at the top of this file.
+	//
+	// So widen it with a random low component: a collision now needs the same
+	// second AND the same draw. rand(1000) returns 0..999
+	// (doc/script_commands.txt:8261-8269). Script integers are int64
+	// (src/map/script.hpp:286) and both ro_admin_commands.claimed_by and
+	// ro_admin_overlay.instance_id are BIGINT, so the multiplication has room.
+	// This is collision-resistant, not collision-proof -- it is a detector,
+	// and the detector only has to be better than the thing it detects.
+	.instance = gettimetick(2) * 1000 + rand(1000);
+	.version$ = "1";
+	// Must match the OnTimer label below. It is an UPPER BOUND on throughput,
+	// not a rate: initnpctimer at L_Reschedule restarts the clock at the END
+	// of the body (src/map/script.cpp:11744-11746), and the body runs
+	// synchronously on the map-server thread through several MySQL round
+	// trips. The real period is 1000ms plus however long that took, so the
+	// queue drains at AT MOST one action per second.
+	.poll_ms = 1000;
+	initnpctimer;
+	debugmes "[ro-admin] overlay v" + .version$ + " online, instance " + .instance;
+	end;
+
+OnTimer1000:
+	// Heartbeat FIRST, unconditionally. It must be written even when the
+	// queue is empty and even when a command fails -- it answers "is this
+	// script running", not "is this script succeeding". Conflating the two
+	// would make a single bad command look like an uninstalled overlay.
+	query_sql "REPLACE INTO ro_admin_overlay (id, instance_id, version, poll_ms, last_seen) "
+		+ "VALUES (1, " + .instance + ", '" + .version$ + "', " + .poll_ms + ", NOW())";
+
+	// query_sql returns early on a zero-row result WITHOUT touching its
+	// destination variables (src/map/script.cpp:18086-18090), so an emptiness
+	// check reads whatever was there before. Today nothing can be: each timer
+	// firing gets a fresh scope (script_alloc_state, src/map/script.cpp:3627).
+	// Clearing here makes the guarantee a property of this line rather than of
+	// the invocation model, so draining more than one row per tick later does
+	// not silently reprocess the previous row. deletearray on an array that
+	// does not exist is a no-op (src/map/script.cpp:6561-6563).
+	deletearray .@row;
+	query_sql "SELECT id FROM ro_admin_commands WHERE status = 'pending' ORDER BY id ASC LIMIT 1", .@row;
+	if (getarraysize(.@row) == 0)
+		goto L_Reschedule;
+	.@cmd = .@row;
+
+	// Compare-and-swap. The UPDATE only fires on a row still 'pending', and
+	// the SELECT only returns it if OUR instance stamped it. With one
+	// consumer this always succeeds; if it ever does not, a second consumer
+	// exists and the queue is a coin flip.
+	query_sql "UPDATE ro_admin_commands SET status = 'processing', claimed_by = " + .instance
+		+ ", claimed_at = NOW() WHERE id = " + .@cmd + " AND status = 'pending'";
+	deletearray .@char_id;
+	deletearray .@action$;
+	deletearray .@a1;
+	deletearray .@a2;
+	query_sql "SELECT char_id, action, arg_int, arg_int2 FROM ro_admin_commands "
+		+ "WHERE id = " + .@cmd + " AND claimed_by = " + .instance,
+		.@char_id, .@action$, .@a1, .@a2;
+	if (getarraysize(.@char_id) == 0) {
+		debugmes "[ro-admin] LOST RACE for row " + .@cmd + " -- another consumer is on this queue";
+		goto L_Reschedule;
+	}
+
+	.@err$ = "";
+
+	deletearray .@aid;
+	query_sql "SELECT account_id FROM `char` WHERE char_id = " + .@char_id, .@aid;
+	if (getarraysize(.@aid) == 0) {
+		.@err$ = "no such character";
+		goto L_Finish;
+	}
+
+	// isloggedin() is map_id2sd() -- map-server memory, the only thing that
+	// answers "is there a session to act on". char.online is the char
+	// server's opinion and is stale after a crash.
+	//
+	// There is deliberately NO offline branch. Writing to `inventory` or
+	// `char` directly would bypass the game's stacking and cap rules, and
+	// would skip whatever logging the server does perform. Going through the
+	// game means the action takes the code path that LOGS WHEN LOGGING IS
+	// ENABLED. That is a weaker promise than "always audited", and the two
+	// Tier 1 actions do not get the same treatment:
+	//
+	//   give_item   -> picklog. Gated on `enable_logs & LOG_TYPE_SCRIPT`
+	//                  (src/map/log.cpp:210-213). rAthena ships
+	//                  `enable_logs: 0xFFFFFFFF` (conf/log_athena.conf:44),
+	//                  so on a stock install this is ON and the row records
+	//                  the receiving char_id.
+	//
+	//   adjust_zeny -> zenylog. Gated on log_config.zeny
+	//                  (src/map/log.cpp:281-282). rAthena ships
+	//                  `log_zeny: 0` (conf/log_athena.conf:93) and the
+	//                  compiled default is also 0 (src/map/log.cpp:578 zeroes
+	//                  the whole struct). So on a stock install @zeny writes
+	//                  NO zenylog row at all. And even with log_zeny turned
+	//                  on, ACMD_FUNC(zeny) calls pc_getzeny / pc_payzeny with
+	//                  three arguments (src/map/atcommand.cpp:2904,2909), so
+	//                  log_charid takes its default of 0
+	//                  (src/map/pc.hpp:1448,1450) and every zenylog row lands
+	//                  with src_id = 0. The log records the change; it never
+	//                  records the actor.
+	//
+	// The only durable record of WHO asked for a zeny adjustment is
+	// ro_admin_commands.requested_by, written by src/ro_admin/overlay.py
+	// before the row is queued. An operator who wants zeny in the game's own
+	// logs as well must set log_zeny in conf/log_athena.conf; this overlay
+	// cannot make that choice for them, and does not pretend it has.
+	if (!isloggedin(.@aid, .@char_id)) {
+		.@err$ = "character is not online";
+		goto L_Finish;
+	}
+
+	// The `false` is the force argument, and it is load-bearing. Omitted, it
+	// defaults to TRUE (src/map/script.cpp:13513-13517) and the guard
+	// degenerates to "is this account online at all" -- it would attach a
+	// player who is mid-conversation with another NPC and swap their script
+	// state out from under them for the duration. rAthena backs that state up
+	// and restores it, so nothing corrupts, but interrupting someone's quest
+	// dialogue to hand them an item is not a call this overlay gets to make.
+	// With force false the condition is `sd != nullptr && !sd->npc_id`
+	// (src/map/script.cpp:13521), so a busy player fails the row cleanly and
+	// the request can simply be reissued.
+	if (!attachrid(.@aid, false)) {
+		.@err$ = "could not attach - player is busy in a script or offline";
+		goto L_Finish;
+	}
+
+	// attachrid can resolve to a session that has already gone away -- seen
+	// when reconnecting quickly. Confirm we are attached to the character we
+	// were asked about before touching anything.
+	if (getcharid(0) != .@char_id) {
+		detachrid;
+		.@err$ = "attached session is a different character";
+		goto L_Finish;
+	}
+
+	// POST-CONDITIONS, not return codes. run_func treats SCRIPT_CMD_FAILURE
+	// as a console warning and lets the script continue
+	// (src/map/script.cpp:4136-4140), so neither getitem nor atcommand can
+	// tell us it failed -- .@err$ would still be empty and the row would be
+	// stamped 'executed' while nothing reached the game. That is precisely
+	// the failure this project exists to remove. So each branch below reads
+	// back the state it just changed, inside the attached scope, and compares
+	// against what was asked.
+	if (.@action$ == "give_item") {
+		// countitem sums `amount` over every non-rental inventory row whose
+		// nameid matches (src/map/script.cpp:7150-7160), so it is also
+		// correct for non-stackable equipment, where each unit occupies its
+		// own row with amount 1. It reads the ATTACHED player's inventory
+		// (src/map/script.cpp:7250,7266). For an unknown item id it pushes 0
+		// (src/map/script.cpp:7260-7264), which is the answer we want: before
+		// and after both read 0 and the delta check fails the row.
+		//
+		// Caught by this: nonexistent item id (src/map/script.cpp:7700-7703),
+		// and every pc_additem rejection -- stack limit, overweight
+		// (src/map/pc.cpp:5964-5971) and no free inventory slot
+		// (src/map/pc.cpp:6001-6004). Also caught: PARTIAL delivery, which
+		// getitem can produce for non-stackables because it adds one unit per
+		// iteration and returns on the first rejection
+		// (src/map/script.cpp:7738-7751).
+		//
+		// KNOWN LIMIT: for a pet-egg item id getitem hands off to
+		// pet_create_egg, which fires an asynchronous intif_create_pet to the
+		// char server (src/map/pet.cpp:684) and the egg arrives after this
+		// tick has ended. Such a row is stamped 'failed' even though the egg
+		// may still land. That is the safe direction to be wrong in -- this
+		// overlay under-claims rather than over-claims -- but it is wrong,
+		// and Tier 1 does not expose pet eggs.
+		.@before = countitem(.@a1);
+		getitem .@a1, .@a2;
+		if (countitem(.@a1) - .@before != .@a2)
+			.@err$ = "item not delivered";
+	} else if (.@action$ == "adjust_zeny") {
+		// Relative by design. @zeny takes a delta; an absolute set would
+		// require read-then-write and would race the player's own spending.
+		//
+		// Script atcommands are dispatched with type 0, and rAthena's
+		// permission gate is `if (type == 1)`, so this runs regardless of the
+		// attached player's group. The mechanism is identity rebinding, not
+		// privilege escalation: the overlay borrows the session, not rights.
+		//
+		// NOTE: this reaches zenylog only if log_zeny is enabled in
+		// conf/log_athena.conf, which ships at 0 -- and even then the row
+		// carries src_id = 0. See the long note above the isloggedin check.
+		//
+		// Zeny is a readable player parameter (doc/script_commands.txt:590)
+		// backed directly by sd->status.zeny (src/map/pc.cpp:10180), and
+		// atcommand runs synchronously on this thread, so the read below sees
+		// the result. This catches the two silent clamps that would otherwise
+		// be reported as full success: pc_getzeny truncates a gain to fit
+		// MAX_ZENY (src/map/pc.cpp:5798-5799), and ACMD_FUNC(zeny) truncates
+		// a deduction to the balance the player actually has
+		// (src/map/atcommand.cpp:2908) -- a PARTIAL debit.
+		.@before = Zeny;
+		atcommand "@zeny " + .@a1;
+		if (Zeny - .@before != .@a1)
+			.@err$ = "zeny not applied";
+	} else {
+		detachrid;
+		// Unreachable when the API is the only writer -- it validates the
+		// action name. Present because "unreachable" is a claim about a
+		// process, and processes change.
+		.@err$ = "unknown action";
+		goto L_Finish;
+	}
+	detachrid;
+
+L_Finish:
+	// Every string written here is a literal from this file, and none of them
+	// contains a quote character. Nothing from the queue is concatenated into
+	// SQL, which is what makes the invariant at the top of this file checkable
+	// rather than aspirational.
+	if (.@err$ == "")
+		query_sql "UPDATE ro_admin_commands SET status = 'executed', finished_at = NOW() "
+			+ "WHERE id = " + .@cmd;
+	else
+		query_sql "UPDATE ro_admin_commands SET status = 'failed', finished_at = NOW(), "
+			+ "error_message = '" + .@err$ + "' WHERE id = " + .@cmd;
+
+L_Reschedule:
+	stopnpctimer;
+	initnpctimer;
+	end;
+}

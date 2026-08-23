@@ -11,12 +11,20 @@ from fastapi.responses import JSONResponse
 from ro_admin.config import Settings
 from ro_admin.db import Database
 
-from ro_admin.routers import auth, items, logs, system
+from ro_admin.routers import auth, commands, items, logs, system
 
 app = FastAPI(
     title="ro-admin",
     version="0.1.0",
-    description="Administration API for rAthena servers. Tier 0: database only.",
+    # Ships in the generated OpenAPI document, which is what a consuming agent
+    # reads to find out what this install is. "Tier 0: database only" was true
+    # until the overlay landed; leaving it would have been a false claim in the
+    # one document the skill treats as authoritative.
+    description=(
+        "Administration API for rAthena servers. Tier 0 reads the database. "
+        "Tier 1, where the overlay script is installed, applies item grants "
+        "and zeny adjustments inside the running game -- see overlay/README.md."
+    ),
 )
 
 @app.on_event("startup")
@@ -38,6 +46,7 @@ app.include_router(auth.router)
 app.include_router(logs.router)
 app.include_router(system.router)
 app.include_router(items.router)
+app.include_router(commands.router)
 
 
 @app.get("/healthz", tags=["system"], summary="Liveness and database reachability")
