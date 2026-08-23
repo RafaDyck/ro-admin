@@ -5,14 +5,37 @@ A modern administration API for [rAthena](https://github.com/rathena/rathena) se
 ## What this is, and is not
 
 **Is:** an operator's administration API — **forensics** over rAthena's own logs and **live GM
-operations** applied inside the running game server. Five routers ship today: `auth`, `logs`
+operations** applied inside the running game server. Seven routers ship today: `auth`, `logs`
 (GM commands, zeny changes, item transactions, and a per-character timeline across all three),
-`system` (capability reporting), `items` (id-to-name lookup), and `commands` (the Tier 1 queue:
-item grants and zeny adjustments).
+`system` (capability reporting), `items` (id-to-name lookup), `accounts` and `characters`
+(reads over the `login` and `char` tables, including a character's inventory), and `commands`
+(the Tier 1 queue: item grants and zeny adjustments).
 
-**Does not yet include:** account or character management. There is no `/accounts` or
-`/characters` endpoint, and nothing here edits a `login` or `char` row — reads go through the
-log tables, and the only writes go through the game server itself.
+| Endpoint | Notes |
+|---|---|
+| `POST /api/v1/auth/login`, `GET /api/v1/auth/me` | Sign in as an rAthena account; report the principal |
+| `GET /api/v1/logs/commands` | GM commands (`atcommandlog`) |
+| `GET /api/v1/logs/zeny` | Zeny changes (`zenylog`) |
+| `GET /api/v1/logs/items` | Item transactions (`picklog`) |
+| `GET /api/v1/logs/timeline` | All three merged per character, chronologically |
+| `GET /api/v1/system/capabilities` | Which tiers and log tables this install actually has |
+| `GET /api/v1/items/{item_id}` | Id-to-name from the operator's own `item_db` |
+| `GET /api/v1/accounts` | Filters: `userid` (exact), `min_group_id`; `limit`/`offset` |
+| `GET /api/v1/accounts/{account_id}` | One account |
+| `GET /api/v1/accounts/{account_id}/characters` | That account's characters |
+| `GET /api/v1/characters` | Filters: `name` (exact), `account_id`, `online`; `limit`/`offset` |
+| `GET /api/v1/characters/{char_id}` | One character |
+| `GET /api/v1/characters/{char_id}/inventory` | Inventory, item names resolved server-side |
+| `POST /api/v1/commands`, `GET /api/v1/commands/{id}` | Tier 1 only: enqueue an action, poll its outcome |
+| `GET /healthz` | Unauthenticated liveness, and a real database round trip |
+
+**Reads accounts and characters; does not manage them.** The account and character
+endpoints are reads only — nothing in this API edits a `login` or `char` row. There is
+no ban, no password reset, no stat edit and no character deletion, and the only writes
+of any kind go through the game server itself via Tier 1. Account responses serve an
+explicit column allowlist, so no password, pincode or session token is ever in one.
+Because the `char` table is a mirror the map server flushes on logout or every
+`autosave_time`, every character response carries `stale` and `stale_fields` saying so.
 
 **Is not:** a FluxCP replacement. FluxCP is two products: of its 135 actions, only 49 require
 admin. The other 64% is a player-facing control panel — registration, rankings, donations,
@@ -28,7 +51,7 @@ seams. You keep pulling upstream.
 
 | Tier | You do | You get |
 |---|---|---|
-| **0 — Database** | Point it at your MySQL. Nothing installed. | **Forensics/logs** — GM commands, zeny, item transactions, per-character timeline — plus item lookup and a health/capability report |
+| **0 — Database** | Point it at your MySQL. Nothing installed. | **Forensics/logs** — GM commands, zeny, item transactions, per-character timeline — plus **account and character reads** (accounts, characters, inventories), item lookup and a health/capability report |
 | **1 — Script overlay** *(shipping)* | Run `overlay/schema.sql`, drop one NPC file in `npc/custom/`, add one line to `scripts_custom.conf`. No recompile. | Item grants and zeny adjustments applied **inside the running game**: the game's own stacking, weight and cap rules; whatever logging the server has enabled; visible without a relog; and an outcome recorded only after the change was read back and confirmed |
 | **2 — Compiled hooks** | Add an `.inc` to `src/custom/`, rebuild. | Custom atcommands and script functions |
 
@@ -68,8 +91,10 @@ API docs at http://localhost:8000/docs
 
 `ro-admin` is an independent service. It contains no rAthena source, links no
 rAthena code, and redistributes no game data — it connects to your database
-over a normal MySQL connection and reads what is already there. Item and job
-names come from *your* `item_db` at runtime, never bundled here.
+over a normal MySQL connection and reads what is already there. Item names come
+from *your* `item_db` at runtime, never bundled here. Job names are not served at
+all: rAthena keeps job data in YAML on the server's filesystem rather than in the
+database, so a character's `class` is returned as the bare rAthena job id.
 
 Tier 1 adds two tables of its own, both prefixed `ro_admin_`, and one NPC
 script you copy into `npc/custom/` — rAthena's own extension seam. It modifies
