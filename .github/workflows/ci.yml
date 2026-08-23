@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - name: Unit tests (no database required)
+        run: python -m pytest -v -m "not integration"
+      - name: OpenAPI document generates
+        run: python scripts/dump_openapi.py > /dev/null
+      - name: No dead code
+        # Validated against the predecessor's backend: finds all 13 of its
+        # unreachable executor methods, and reports this repo clean.
+        run: python scripts/check_dead_code.py
+      - name: No bundled game data
+        # The predecessor accumulated 285 hardcoded item names in a React
+        # component while the database held 28,525. It arrived one literal at a
+        # time, each defensible alone -- so this is a gate, not a guideline.
+        run: python scripts/check_no_game_data.py

@@ -1,0 +1,54 @@
+# Paste this service into the compose file that already runs your rAthena
+# server, or run it standalone with `docker compose -f docker-compose.example.yml up`.
+#
+# ro-admin needs one thing: a TCP route to your MySQL. It does not need to be
+# on the same host as the game server, does not read your rAthena config files,
+# and does not need the Docker socket.
+
+services:
+  ro-admin:
+    build: .
+    # or, once published:  image: ghcr.io/rafadyck/ro-admin:latest
+    container_name: ro_admin
+    ports:
+      - "8000:8000"
+    environment:
+      # REQUIRED. The service refuses to start without these -- there are no
+      # development fallbacks, because a fallback secret in software other
+      # people install is a published credential.
+      RO_ADMIN_JWT_SECRET: "${RO_ADMIN_JWT_SECRET:?set a long random value}"
+      RO_ADMIN_DB_USER: "${RO_ADMIN_DB_USER:?set your rAthena database user}"
+      RO_ADMIN_DB_PASSWORD: "${RO_ADMIN_DB_PASSWORD:?set your rAthena database password}"
+
+      # Point at YOUR database. Inside a compose network this is the service
+      # name and the container port; from a host it is whatever you publish.
+      # Both come from the environment on purpose -- on the machine this was
+      # developed on, a native MariaDB owned host port 3306 and shadowed the
+      # container, and that was a config change rather than a code change
+      # precisely because these are not hardcoded.
+      RO_ADMIN_DB_HOST: "${RO_ADMIN_DB_HOST:-mysql}"
+      RO_ADMIN_DB_PORT: "${RO_ADMIN_DB_PORT:-3306}"
+      RO_ADMIN_DB_NAME: "${RO_ADMIN_DB_NAME:-ragnarok}"
+
+      # Set true only if your server has use_MD5_passwords enabled.
+      RO_ADMIN_MD5_PASSWORDS: "${RO_ADMIN_MD5_PASSWORDS:-false}"
+
+    # Read-only root filesystem: this service writes nothing to disk.
+    read_only: true
+    tmpfs:
+      - /tmp
+    # Drop every Linux capability. It opens a socket and talks to MySQL.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+    # Join the network your rAthena stack already uses.
+    networks:
+      - ragnarok_net
+
+networks:
+  ragnarok_net:
+    external: true
+    name: ro-server_ragnarok_net
