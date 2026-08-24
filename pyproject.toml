@@ -21,4 +21,8 @@ dev = ["pytest>=8", "httpx>=0.27"]
 [tool.pytest.ini_options]
 markers = ["integration: requires a running rAthena database"]
 testpaths = ["tests"]
-pythonpath = ["src"]
+# "." alongside "src" because importers/ is a repo-checkout tool, not part of
+# the installed distribution -- like overlay/, an operator runs it from a clone.
+# Without it, bare `pytest` fails to import importers.* while `python -m pytest`
+# succeeds, because only the latter prepends the working directory to sys.path.
+pythonpath = [".", "src"]

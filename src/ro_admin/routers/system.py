@@ -13,6 +13,8 @@ Tier 2 remains stubbed; its artifact does not exist yet, and reporting a
 capability we cannot deliver is exactly the failure mode the predecessor had
 when its UI claimed changes were live.
 """
+from datetime import datetime
+
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
@@ -21,6 +23,7 @@ from ro_admin.db import Database
 from ro_admin.deps import get_settings, requires
 from ro_admin.overlay import read_status
 from ro_admin.permissions import Permission
+from ro_admin.routers.maps import MAPS_NOT_IMPORTED
 
 router = APIRouter(prefix="/api/v1/system", tags=["system"])
 
@@ -46,10 +49,44 @@ class Tier(BaseModel):
     version: str | None = None
 
 
+class Maps(BaseModel):
+    imported: bool
+    count: int
+    reason: str
+    imported_at: datetime | None = None
+
+
 class Capabilities(BaseModel):
     tier0: Tier0
     tier1: Tier
     tier2: Tier
+    maps: Maps
+
+
+def _maps(db: Database, present: set[str]) -> Maps:
+    """Reported from the table, not from a setting that claims it.
+
+    rAthena has no map list in SQL, so an install that has not run the importer
+    genuinely cannot answer map questions -- and saying so is more useful than
+    an empty list, which reads as "this server has no maps".
+    """
+    if "ro_admin_maps" not in present:
+        # Imported from routers/maps.py so the map endpoints' 503 and this
+        # reason are the same sentence, not two that agree today.
+        return Maps(imported=False, count=0, reason=MAPS_NOT_IMPORTED)
+    row = db.query(
+        "SELECT COUNT(*) AS n, MAX(imported_at) AS at FROM ro_admin_maps"
+    )[0]
+    count = int(row["n"])
+    if count == 0:
+        return Maps(
+            imported=False, count=0,
+            reason="map table exists but is empty: run importers/import_maps.py",
+        )
+    return Maps(
+        imported=True, count=count, imported_at=row["at"],
+        reason=f"{count} maps imported",
+    )
 
 
 def _tier1(db: Database) -> Tier:
@@ -85,4 +122,5 @@ def capabilities(settings: Settings = Depends(get_settings)) -> Capabilities:
         ),
         tier1=_tier1(db),
         tier2=Tier(available=False, reason="compiled hooks not implemented in this release"),
+        maps=_maps(db, present),
     )

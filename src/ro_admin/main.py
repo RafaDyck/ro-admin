@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from ro_admin.config import Settings
 from ro_admin.db import Database
 
-from ro_admin.routers import accounts, auth, characters, commands, items, logs, system
+from ro_admin.routers import accounts, auth, characters, commands, items, logs, maps, system
 
 app = FastAPI(
     title="ro-admin",
@@ -49,6 +49,7 @@ app.include_router(items.router)
 app.include_router(commands.router)
 app.include_router(accounts.router)
 app.include_router(characters.router)
+app.include_router(maps.router)
 
 
 @app.get("/healthz", tags=["system"], summary="Liveness and database reachability")

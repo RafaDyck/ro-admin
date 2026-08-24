@@ -14,6 +14,15 @@ not end up in shell history or process listings:
 
     RO_ADMIN_URL     default http://localhost:8000
     RO_ADMIN_TOKEN   a service token from scripts/mint_token.py
+
+Exit codes, because a caller has to be able to tell these apart:
+
+    0   the server answered 200 and its JSON was printed
+    1   the server answered something other than 200; the body was printed
+    2   this tool could not do what was asked -- no token, a malformed
+        key=value, or a body it will not write to stdout (see describe_body).
+        Never a silent 0: an empty-looking success is the one outcome this
+        tool must never produce.
 """
 import argparse
 import json
@@ -66,7 +75,59 @@ def parse_params(pairs: list[str]) -> dict:
     return out
 
 
-def _request(url: str, token: str | None) -> tuple[int, str]:
+def is_json(content_type: str) -> bool:
+    """Whether a Content-Type header names a JSON body.
+
+    Decided from the header the server sent, not from whether json.loads
+    happens to succeed on the bytes. Guessing at a body's meaning from its
+    contents is precisely how this tool used to print 122,304 invisible gat
+    bytes and call it a response.
+    """
+    kind = content_type.split(";", 1)[0].strip().lower()
+    return kind == "application/json" or kind.endswith("+json")
+
+
+def describe_body(url: str, status: int, body: bytes, content_type: str) -> str:
+    """What to say instead of writing a non-JSON body to a terminal.
+
+    `roadmin get maps/prontera/cells` used to print 122,304 bytes of gat cell
+    types and exit 0. Types 0-6 are unprintable control characters, so what an
+    operator -- or an agent reading a transcript -- saw was a blank line and a
+    success, which reads as "this map has no cells". A false negative wearing
+    the shape of a successful call is the exact failure this project exists to
+    remove, so it must be impossible to reach from here.
+
+    The byte count and a first-bytes preview are the whole point: they make it
+    concrete that something arrived. "Cannot display" alone would still leave
+    the reader unable to tell full from empty.
+    """
+    head = f"<{len(body)} bytes of {content_type or 'an unnamed content type'}> (HTTP {status})"
+    seen = (
+        "first bytes: " + " ".join(f"{b:02x}" for b in body[:16]) + ("..." if len(body) > 16 else "")
+        if body else
+        "the body really is empty -- zero bytes, not merely unprintable"
+    )
+    return "\n".join([
+        head,
+        seen,
+        "",
+        "Not printed: this is not JSON, and a binary body written to a terminal",
+        "looks exactly like an empty response.",
+        "",
+        "Save it with curl, which can write it to a file:",
+        "",
+        '  curl -sS -o out.bin -H "Authorization: Bearer $RO_ADMIN_TOKEN" \\',
+        f'    "{url}"',
+    ])
+
+
+def _request(url: str, token: str | None) -> tuple[int, bytes, str]:
+    """Status, raw body, and the declared content type.
+
+    Bytes rather than str: the caller decides whether this is text at all, and
+    .decode() on a binary body either raises or -- worse, for gat data, which
+    is valid UTF-8 -- succeeds and yields something unprintable.
+    """
     req = urllib.request.Request(url)
     if token:
         # Strip whitespace before it reaches the header. On Windows, print()
@@ -77,13 +138,14 @@ def _request(url: str, token: str | None) -> tuple[int, str]:
         req.add_header("Authorization", f"Bearer {token.strip()}")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.status, resp.read().decode()
+            return resp.status, resp.read(), resp.headers.get("Content-Type", "")
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read().decode()
+        return exc.code, exc.read(), exc.headers.get("Content-Type", "")
 
 
 def _discover(base: str, token: str | None) -> int:
-    status, body = _request(build_url(base, "/openapi.json"), token)
+    status, raw, _ = _request(build_url(base, "/openapi.json"), token)
+    body = raw.decode(errors="replace")
     if status != 200:
         print(redact(f"could not read the API description ({status}): {body[:300]}"))
         return 1
@@ -127,7 +189,19 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc))
         return 2
 
-    status, body = _request(build_url(base, args.path, params), token)
+    url = build_url(base, args.path, params)
+    status, raw, content_type = _request(url, token)
+
+    if not is_json(content_type):
+        print(redact(describe_body(url, status, raw, content_type)))
+        # 2, not 0. The request succeeded; this tool did not hand over the
+        # bytes, and a script must not carry on as though it had. Exiting 0
+        # would put a human-readable notice where a caller redirecting to a
+        # file expects a payload, and 2 is already what this CLI returns for
+        # "you asked for something it cannot do" -- no token, bad key=value.
+        return 2
+
+    body = raw.decode(errors="replace")
     try:
         body = json.dumps(json.loads(body), indent=2, default=str)
     except json.JSONDecodeError:
