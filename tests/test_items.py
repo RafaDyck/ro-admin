@@ -80,3 +80,55 @@ def test_item_logs_carry_names_so_callers_need_no_lookup_table(client):
     for entry in items:
         assert "item_name" in entry
         assert entry["item_name"], f"item {entry['item_id']} resolved to an empty name"
+
+
+@pytest.mark.integration
+def test_detail_carries_the_stats_that_answer_what_is_this(client):
+    token = _token(client, ADMIN_USER, ADMIN_PASSWORD)
+    body = client.get("/api/v1/items/909", headers={"Authorization": f"Bearer {token}"}).json()
+    for field in ("weight", "price_buy", "price_sell", "slots", "equip_level_min"):
+        assert field in body
+
+
+@pytest.mark.integration
+def test_detail_carries_the_script_so_behaviour_is_visible(client):
+    """"What does this item actually do" is answered by its rAthena script,
+    and that is knowledge only the server has. Red Potion (501) has one."""
+    token = _token(client, ADMIN_USER, ADMIN_PASSWORD)
+    body = client.get("/api/v1/items/501", headers={"Authorization": f"Bearer {token}"}).json()
+    assert "script" in body
+    assert body["script"], "Red Potion has a heal script"
+
+
+@pytest.mark.integration
+def test_an_item_with_no_script_reports_null_not_an_empty_string(client):
+    """Jellopy is an etc item and does nothing. null says "no script"; ""
+    would be indistinguishable from "a script that is blank"."""
+    token = _token(client, ADMIN_USER, ADMIN_PASSWORD)
+    body = client.get("/api/v1/items/909", headers={"Authorization": f"Bearer {token}"}).json()
+    assert body["script"] is None
+
+
+@pytest.mark.integration
+def test_the_detail_response_is_a_superset_of_the_search_row(client):
+    """Fetching the detail of a row you just listed must not lose a field."""
+    token = _token(client, ADMIN_USER, ADMIN_PASSWORD)
+    headers = {"Authorization": f"Bearer {token}"}
+    listed = client.get(
+        "/api/v1/items", params={"q": "Jellopy"}, headers=headers
+    ).json()["items"][0]
+    detail = client.get(f"/api/v1/items/{listed['id']}", headers=headers).json()
+    assert set(listed) <= set(detail)
+
+
+@pytest.mark.integration
+def test_the_original_field_names_still_work(client):
+    """item_id and name are published in the OpenAPI document and referenced in
+    skill/SKILL.md. They are kept deliberately, not by oversight -- renaming
+    them would break existing callers so that two field names could match."""
+    token = _token(client, ADMIN_USER, ADMIN_PASSWORD)
+    body = client.get("/api/v1/items/909", headers={"Authorization": f"Bearer {token}"}).json()
+    assert body["item_id"] == 909
+    assert body["name"] == "Jellopy"
+    assert body["id"] == body["item_id"]
+    assert body["name_english"] == body["name"]

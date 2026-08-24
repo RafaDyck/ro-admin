@@ -7,7 +7,8 @@ A modern administration API for [rAthena](https://github.com/rathena/rathena) se
 **Is:** an operator's administration API — **forensics** over rAthena's own logs and **live GM
 operations** applied inside the running game server. Seven routers ship today: `auth`, `logs`
 (GM commands, zeny changes, item transactions, and a per-character timeline across all three),
-`system` (capability reporting), `items` (id-to-name lookup), `accounts` and `characters`
+`system` (capability reporting), `items` (search, type facets and full item detail
+including the rAthena script), `accounts` and `characters`
 (reads over the `login` and `char` tables, including a character's inventory), and `commands`
 (the Tier 1 queue: item grants and zeny adjustments).
 
@@ -19,7 +20,9 @@ operations** applied inside the running game server. Seven routers ship today: `
 | `GET /api/v1/logs/items` | Item transactions (`picklog`) |
 | `GET /api/v1/logs/timeline` | All three merged per character, chronologically |
 | `GET /api/v1/system/capabilities` | Which tiers and log tables this install actually has |
-| `GET /api/v1/items/{item_id}` | Id-to-name from the operator's own `item_db` |
+| `GET /api/v1/items` | Search the operator's own `item_db`: `q` (substring of `name_english`, `name_aegis` or `alias_name`), `type`, `subtype`, `slots`; `limit`/`offset` |
+| `GET /api/v1/items/types` | The item types this server actually has, with counts |
+| `GET /api/v1/items/{item_id}` | One item in full — names, stats, prices and its rAthena `script` |
 | `GET /api/v1/accounts` | Filters: `userid` (exact), `min_group_id`; `limit`/`offset` |
 | `GET /api/v1/accounts/{account_id}` | One account |
 | `GET /api/v1/accounts/{account_id}/characters` | That account's characters |
@@ -51,7 +54,7 @@ seams. You keep pulling upstream.
 
 | Tier | You do | You get |
 |---|---|---|
-| **0 — Database** | Point it at your MySQL. Nothing installed. | **Forensics/logs** — GM commands, zeny, item transactions, per-character timeline — plus **account and character reads** (accounts, characters, inventories), item lookup and a health/capability report |
+| **0 — Database** | Point it at your MySQL. Nothing installed. | **Forensics/logs** — GM commands, zeny, item transactions, per-character timeline — plus **account and character reads** (accounts, characters, inventories), item search and detail, and a health/capability report |
 | **1 — Script overlay** *(shipping)* | Run `overlay/schema.sql`, drop one NPC file in `npc/custom/`, add one line to `scripts_custom.conf`. No recompile. | Item grants and zeny adjustments applied **inside the running game**: the game's own stacking, weight and cap rules; whatever logging the server has enabled; visible without a relog; and an outcome recorded only after the change was read back and confirmed |
 | **2 — Compiled hooks** | Add an `.inc` to `src/custom/`, rebuild. | Custom atcommands and script functions |
 

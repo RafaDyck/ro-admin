@@ -74,6 +74,44 @@ CHARACTER_VOLATILE: frozenset[str] = frozenset({
 })
 
 
+# item_db. Unlike `login`, nothing here is sensitive -- this is the operator's
+# own item table and serving it is the point. The split is about RESPONSE SIZE,
+# not secrecy: the table has over seventy columns, three of which hold rAthena
+# script source running to hundreds of characters, and a 200-row page carrying
+# those is a response nobody wants.
+ITEM_LIST_COLUMNS: tuple[str, ...] = (
+    "id",
+    "name_english",
+    "name_aegis",
+    "type",
+    "subtype",
+    "slots",
+    "weight",
+    "price_buy",
+    "price_sell",
+    "equip_level_min",
+)
+
+# Everything the list has, plus what answers "what is this item, exactly".
+# `script` is included because "what does it actually do" is the question an
+# operator investigating an item is asking, and it is knowledge only the
+# server has.
+ITEM_DETAIL_COLUMNS: tuple[str, ...] = ITEM_LIST_COLUMNS + (
+    "alias_name",
+    "attack",
+    "defense",
+    "range",
+    "weapon_level",
+    "armor_level",
+    "equip_level_max",
+    "refineable",
+    "view",
+    "script",
+    "equip_script",
+    "unequip_script",
+)
+
+
 def select_clause(columns: tuple[str, ...]) -> str:
     """Render an allowlist as a backticked SELECT list.
 
