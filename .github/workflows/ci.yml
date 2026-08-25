@@ -27,3 +27,8 @@ jobs:
         # component while the database held 28,525. It arrived one literal at a
         # time, each defensible alone -- so this is a gate, not a guideline.
         run: python scripts/check_no_game_data.py
+      - name: Skill matches the API
+        # The skill is instructions an agent executes. A renamed query
+        # parameter otherwise makes it silently wrong, and nothing reads it
+        # before it acts.
+        run: python scripts/check_skill_matches_api.py
