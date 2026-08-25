@@ -22,8 +22,15 @@ import sys
 from ro_admin.main import app
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-SKILL_FILES = [ROOT / "skill" / "SKILL.md"] + sorted(
-    (ROOT / "skill" / "references").glob("*.md")
+# Everything under skill/ that an operator or agent copies and then types
+# commands out of. INSTALL.md is included deliberately: it ships in the same
+# directory, gets copied into the agent's skills folder alongside the rest, and
+# its token-minting and verification examples rot exactly the way the skill's
+# do. The distinction that matters is not "prose vs instructions" but "does
+# someone run this" -- and they do.
+SKILL_FILES = sorted(
+    [ROOT / "skill" / "SKILL.md", ROOT / "skill" / "INSTALL.md"]
+    + list((ROOT / "skill" / "references").glob("*.md"))
 )
 
 API_PREFIX = "/api/v1/"
