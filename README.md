@@ -34,7 +34,7 @@ including the rAthena script), `accounts` and `characters`
 | `GET /api/v1/maps/{name}` | One map's `width`, `height` and `walkable_cells` |
 | `GET /api/v1/maps/{name}/cell` | What is at one coordinate: the raw rAthena `gat` type plus `walkable`/`shootable`/`water` |
 | `GET /api/v1/maps/{name}/cells` | The whole grid — `width*height` raw bytes, one gat type per cell |
-| `POST /api/v1/commands`, `GET /api/v1/commands/{id}` | Tier 1 only: enqueue an action, poll its outcome |
+| `POST /api/v1/commands`, `GET /api/v1/commands/{id}` | Tier 1 only: enqueue an action, poll its outcome. A negative `adjust_zeny` delta destroys value and needs `confirm: true`, enforced in the API rather than asked of the caller |
 | `GET /healthz` | Unauthenticated liveness, and a real database round trip |
 
 **Reads accounts and characters; does not manage them.** The account and character
@@ -106,18 +106,31 @@ flags, and walkable means `gat not in {1, 5}` rather than `gat == 0`.
 ## AI, deliberately absent
 
 This service makes no model calls and holds no AI credentials. Instead it ships an agent skill
-in `skill/` that drives this API. You bring your own agent and your own inference budget; the
-server stays a plain API.
+in `skill/` — a `SKILL.md` entry point that routes to five references — teaching a coding agent
+to drive this API. **You bring your own agent and your own inference budget; the server stays a
+plain API**, and therefore presents no prompt-injection surface to anyone who installs it,
+because it never sends anything to a model.
 
     python scripts/mint_token.py my-agent logs.read system.read --days 30
     export RO_ADMIN_TOKEN=...
     python -m ro_admin.cli discover
     python -m ro_admin.cli get logs/timeline char_id=150002
+    python -m ro_admin.cli post commands char_id=200000 action=give_item item_id=501 amount=3
+
+The CLI reads (`get`) and, on a Tier 1 server, writes (`post`), taking the token from the
+environment either way so none is assembled by hand. It exits 0 on any 2xx — the `202` from
+`POST /api/v1/commands` is an accepted enqueue, not a failure — and an enqueue is not an
+applied change until the command row reads `executed`.
 
 The skill discovers endpoints from this server's generated OpenAPI document rather than
 carrying a hardcoded list, so it does not go stale when the API changes. Service tokens are
 scoped, and scopes are a ceiling: a token limited to `logs.read` is refused everything else
 regardless of who minted it.
+
+**Installing the skill, and which token to mint: [`skill/INSTALL.md`](skill/INSTALL.md).**
+Read it before handing an agent a token. It covers the three scope recipes, why read-only is
+the right default, the residual risk this design accepts, and the fact that there is no
+revocation list — a token is valid until it expires, so `--days` is the control you have.
 
 ## Quick start
 

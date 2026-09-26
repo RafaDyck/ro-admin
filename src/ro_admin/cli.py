@@ -17,8 +17,10 @@ not end up in shell history or process listings:
 
 Exit codes, because a caller has to be able to tell these apart:
 
-    0   the server answered 200 and its JSON was printed
-    1   the server answered something other than 200; the body was printed
+    0   the server answered 2xx and its JSON was printed. 2xx, not 200:
+        POST /api/v1/commands answers 202 Accepted, and an accepted enqueue
+        is a success.
+    1   the server answered outside 2xx; the body was printed
     2   this tool could not do what was asked -- no token, a malformed
         key=value, or a body it will not write to stdout (see describe_body).
         Never a silent 0: an empty-looking success is the one outcome this
@@ -75,6 +77,35 @@ def parse_params(pairs: list[str]) -> dict:
     return out
 
 
+# An integer literal, optionally negative: `delta=-500` is as ordinary a
+# command-line value as `amount=3`.
+_INT_RE = re.compile(r"^-?\d+$")
+
+
+def parse_body(pairs: list[str]) -> dict:
+    """Turn ['char_id=1', 'amount=3'] into a JSON object, with ints as ints.
+
+    Everything on a command line is a string: `char_id=1` arrives as "1". The
+    API's request models are typed, so posting {"char_id": "1"} is a 422 whose
+    message reads like the caller passed the wrong field -- when in fact they
+    typed exactly the right thing and this tool mangled it in transit. So a
+    value that is entirely digits (with an optional leading '-') is sent as a
+    number.
+
+    Only that shape. `1.5`, `2024-01-01` and `give_item` all stay strings:
+    the rule is deliberately narrow because every widening of it converts some
+    value the caller meant literally. (It does mean `id=007` is sent as 7. The
+    fields this posts to are numeric ids, where that is the intended reading.)
+    """
+    out = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise ValueError(f"expected key=value, got {pair!r}")
+        key, value = pair.split("=", 1)
+        out[key] = int(value) if _INT_RE.match(value) else value
+    return out
+
+
 def is_json(content_type: str) -> bool:
     """Whether a Content-Type header names a JSON body.
 
@@ -87,7 +118,9 @@ def is_json(content_type: str) -> bool:
     return kind == "application/json" or kind.endswith("+json")
 
 
-def describe_body(url: str, status: int, body: bytes, content_type: str) -> str:
+def describe_body(
+    url: str, status: int, body: bytes, content_type: str, method: str = "GET"
+) -> str:
     """What to say instead of writing a non-JSON body to a terminal.
 
     `roadmin get maps/prontera/cells` used to print 122,304 bytes of gat cell
@@ -100,6 +133,11 @@ def describe_body(url: str, status: int, body: bytes, content_type: str) -> str:
     The byte count and a first-bytes preview are the whole point: they make it
     concrete that something arrived. "Cannot display" alone would still leave
     the reader unable to tell full from empty.
+
+    `method` exists so this never suggests replaying a write. The curl line
+    below re-issues the request, which is sound advice for a GET and wrong for
+    a POST: the command may well have been enqueued already, and running it
+    again to see the body would enqueue it a second time.
     """
     head = f"<{len(body)} bytes of {content_type or 'an unnamed content type'}> (HTTP {status})"
     seen = (
@@ -107,28 +145,46 @@ def describe_body(url: str, status: int, body: bytes, content_type: str) -> str:
         if body else
         "the body really is empty -- zero bytes, not merely unprintable"
     )
-    return "\n".join([
+    lines = [
         head,
         seen,
         "",
         "Not printed: this is not JSON, and a binary body written to a terminal",
         "looks exactly like an empty response.",
         "",
-        "Save it with curl, which can write it to a file:",
-        "",
-        '  curl -sS -o out.bin -H "Authorization: Bearer $RO_ADMIN_TOKEN" \\',
-        f'    "{url}"',
-    ])
+    ]
+    if method == "GET":
+        lines += [
+            "Save it with curl, which can write it to a file:",
+            "",
+            '  curl -sS -o out.bin -H "Authorization: Bearer $RO_ADMIN_TOKEN" \\',
+            f'    "{url}"',
+        ]
+    else:
+        lines += [
+            f"Not replayed: this was a {method} to {url}, and re-sending it to read",
+            "the body would repeat the write. Check the server's logs instead.",
+        ]
+    return "\n".join(lines)
 
 
-def _request(url: str, token: str | None) -> tuple[int, bytes, str]:
+def _request(
+    url: str, token: str | None, method: str = "GET", body: bytes | None = None
+) -> tuple[int, bytes, str]:
     """Status, raw body, and the declared content type.
 
     Bytes rather than str: the caller decides whether this is text at all, and
     .decode() on a binary body either raises or -- worse, for gat data, which
     is valid UTF-8 -- succeeds and yields something unprintable.
     """
-    req = urllib.request.Request(url)
+    # method is passed explicitly rather than left to urllib's inference.
+    # urllib picks POST whenever `data` is not None and GET otherwise, so a
+    # future caller posting an empty body would instead GET /api/v1/commands,
+    # get back 200 and a list of queued rows, and exit 0 -- a write that never
+    # happened, reported as a success.
+    req = urllib.request.Request(url, data=body, method=method)
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
     if token:
         # Strip whitespace before it reaches the header. On Windows, print()
         # emits \r\n and shell command substitution removes only the \n, so a
@@ -171,6 +227,9 @@ def main(argv: list[str] | None = None) -> int:
     get = sub.add_parser("get", help="GET an endpoint")
     get.add_argument("path", help="e.g. /logs/timeline (the /api/v1 prefix is optional)")
     get.add_argument("params", nargs="*", help="key=value query parameters")
+    post = sub.add_parser("post", help="POST a JSON body to an endpoint")
+    post.add_argument("path", help="e.g. /commands (the /api/v1 prefix is optional)")
+    post.add_argument("fields", nargs="*", help="key=value body fields")
 
     args = parser.parse_args(argv)
     base = os.environ.get("RO_ADMIN_URL", "http://localhost:8000")
@@ -183,17 +242,29 @@ def main(argv: list[str] | None = None) -> int:
         print("RO_ADMIN_TOKEN is not set. Mint one with scripts/mint_token.py.")
         return 2
 
+    method = "POST" if args.command == "post" else "GET"
     try:
-        params = parse_params(args.params)
+        if method == "POST":
+            url = build_url(base, args.path)
+            payload = json.dumps(parse_body(args.fields)).encode()
+        else:
+            url = build_url(base, args.path, parse_params(args.params))
+            payload = None
     except ValueError as exc:
         print(str(exc))
         return 2
 
-    url = build_url(base, args.path, params)
-    status, raw, content_type = _request(url, token)
+    if method == "POST":
+        status, raw, content_type = _request(url, token, method="POST", body=payload)
+    else:
+        # The read path calls _request exactly as it always did, two positional
+        # arguments. The new parameters are additive on purpose: `get` is what
+        # every example in SKILL.md uses, and widening a signature is only safe
+        # if the untouched caller's call is also untouched.
+        status, raw, content_type = _request(url, token)
 
     if not is_json(content_type):
-        print(redact(describe_body(url, status, raw, content_type)))
+        print(redact(describe_body(url, status, raw, content_type, method)))
         # 2, not 0. The request succeeded; this tool did not hand over the
         # bytes, and a script must not carry on as though it had. Exiting 0
         # would put a human-readable notice where a caller redirecting to a
@@ -207,7 +278,12 @@ def main(argv: list[str] | None = None) -> int:
     except json.JSONDecodeError:
         pass
     print(redact(body))
-    return 0 if status == 200 else 1
+    # Any 2xx, not just 200. POST /api/v1/commands answers 202 Accepted -- the
+    # command is queued, which is the whole of what an enqueue can promise --
+    # so an `== 200` test here would report every successful write as a
+    # failure. That is a false negative dressed as a real error, the exact
+    # thing this CLI exists to stop producing.
+    return 0 if 200 <= status < 300 else 1
 
 
 if __name__ == "__main__":

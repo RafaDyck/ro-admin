@@ -34,7 +34,14 @@ SRC = ROOT / "src"
 REFERENCE_DIRS = [ROOT / "src", ROOT / "tests", ROOT / "scripts"]
 
 ALWAYS_ALIVE = {"app", "main", "router"}
-DECORATOR_HINTS = ("router.", "app.", "pytest.fixture", "fixture", "field_validator", "property")
+# `model_validator` belongs beside `field_validator` for exactly the same
+# reason: pydantic invokes both, and neither is ever called by name. Its absence
+# made commands._destructive_needs_confirmation -- the negative-zeny gate, with
+# five tests on it in test_confirmation.py -- report as unreachable.
+DECORATOR_HINTS = (
+    "router.", "app.", "pytest.fixture", "fixture",
+    "field_validator", "model_validator", "property",
+)
 
 DEFINITION = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 

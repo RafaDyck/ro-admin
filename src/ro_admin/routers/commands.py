@@ -25,7 +25,7 @@ from datetime import datetime
 from typing import Annotated, Literal, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ro_admin.config import Settings
 from ro_admin.db import Database
@@ -63,6 +63,15 @@ class AdjustZeny(BaseModel):
     action: Literal["adjust_zeny"]
     char_id: int = Field(gt=0)
     delta: int = Field(ge=-1_000_000_000, le=1_000_000_000)
+    confirm: bool = Field(
+        default=False,
+        description=(
+            "Required when delta is negative. Taking zeny away destroys value, "
+            "and the spec's mitigation for pointing an agent at a live server "
+            "is that destructive actions confirm REGARDLESS OF CALLER -- an "
+            "instruction to a client is not enforcement."
+        ),
+    )
 
     @field_validator("delta")
     @classmethod
@@ -77,6 +86,17 @@ class AdjustZeny(BaseModel):
                 "game (src/map/atcommand.cpp:2897-2900) and does nothing"
             )
         return value
+
+    @model_validator(mode="after")
+    def _destructive_needs_confirmation(self):
+        # Narrow on purpose. A blanket confirm flag is one every caller learns
+        # to always send, which is the same as having no gate.
+        if self.delta < 0 and not self.confirm:
+            raise ValueError(
+                f"removing {abs(self.delta)} zeny is destructive; "
+                "resend with confirm=true to proceed"
+            )
+        return self
 
 
 CommandRequest = Annotated[Union[GiveItem, AdjustZeny], Field(discriminator="action")]
@@ -141,7 +161,12 @@ def create_command(
         # cheerful message.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=overlay.reason)
 
-    args = body.model_dump(exclude={"action", "char_id"})
+    # `confirm` is a gate on this request, not an argument to the game command.
+    # overlay.validate() reads only the names in its own spec and would ignore
+    # it today, so this exclusion is not load-bearing yet -- it is here so that
+    # the day a spec gains a `confirm` argument, or validate() starts refusing
+    # unexpected keys, this caller is not the one that breaks.
+    args = body.model_dump(exclude={"action", "char_id", "confirm"})
     try:
         new_id = enqueue(
             db,
