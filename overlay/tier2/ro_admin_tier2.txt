@@ -1,0 +1,229 @@
+//===== ro-admin =============================================
+//= Tier 2 overlay
+//===== Project: =============================================
+//= https://github.com/RafaDyck/ro-admin
+//===== Version: =============================================
+//= 1
+//===== Source citations: ====================================
+//= The `src/map/...` line numbers below were read against
+//= rAthena at commit ad04a42 (2025-08-04) -- the revision this
+//= project's lab compiles. Upstream moves them: rAthena is a
+//= live project and these are not stable addresses. If a line
+//= no longer says what a comment here claims, re-derive it
+//= rather than assume drift.
+//===== Description: =========================================
+//= Consumes `sync_character` rows from ro_admin_commands and
+//= calls the compiled hook ro_admin_sync(), which flushes a
+//= connected character's in-memory state to the database.
+//=
+//= THIS FILE ONLY LOADS IF THE HOOK WAS COMPILED. A script
+//= naming an unknown buildin fails to parse, logs the error,
+//= and leaves an inert NPC -- the server keeps running and the
+//= Tier 1 overlay is unaffected (parse_script's setjmp handler
+//= returns nullptr, src/map/script.cpp:2503-2518, and
+//= npc_parse_script guards its result with `if (script)`,
+//= src/map/npc.cpp:4421-4424). So the heartbeat this writes IS
+//= the Tier 2 detection: no compile, no row.
+//=
+//= Same invariants as the Tier 1 overlay: one consumer per
+//= row, claimed by compare-and-swap, and no string from
+//= outside this file ever concatenated into SQL.
+//=
+//= INVARIANT: this script is the ONLY consumer of
+//= `sync_character` rows, and it consumes NOTHING ELSE. The
+//= split is enforced from both sides -- the SELECT below
+//= filters `action = 'sync_character'`, and the Tier 1
+//= overlay's SELECT filters `action <> 'sync_character'`.
+//= Both halves are needed: with either one missing, two
+//= consumers race one queue, and a queue with two consumers
+//= is the defect that made this project necessary.
+//=
+//= Enforced by tests/test_overlay_artifact.py.
+//============================================================
+
+-	script	ro_admin_tier2	FAKE_NPC,{
+OnInit:
+	// Same construction and the same reasoning as the Tier 1 overlay: the
+	// unix second (gettimetick(2), doc/script_commands.txt:3394-3401) is too
+	// coarse on its own, so widen it with rand(1000) -> 0..999
+	// (doc/script_commands.txt:8261-8269; the range form subtracts one from
+	// the argument, src/map/script.cpp:5611-5612).
+	//
+	// Two scripts now start inside the same second, so worth stating: rAthena
+	// has ONE process-global mt19937, seeded once from std::random_device at
+	// static-init time (src/common/random.hpp:14-15). The two OnInit blocks
+	// therefore draw from the same stream at different positions -- they get
+	// independent values, not the same value, and a fresh map server gets a
+	// fresh seed rather than a time-derived one. Two independent draws can
+	// still coincide, at 1/1000. That is survivable here rather than merely
+	// unlikely: because the action split above is total these two scripts
+	// never look at the same row, so a shared instance id could not make one
+	// script's compare-and-swap match the other's claim. It would only make
+	// claimed_by ambiguous to a human reading the table, and `action`
+	// disambiguates that.
+	.instance = gettimetick(2) * 1000 + rand(1000);
+	.version$ = "1";
+	// Must match the OnTimer label below, for the same reason as Tier 1: the
+	// API calibrates heartbeat staleness against this number.
+	.poll_ms = 1000;
+	initnpctimer;
+	debugmes "[ro-admin] tier2 v" + .version$ + " online, instance " + .instance;
+	end;
+
+OnTimer1000:
+	// Heartbeat FIRST, unconditionally -- and this line carries more weight
+	// than its Tier 1 counterpart. It is not only "is the script running":
+	// reaching this line at all proves the script PARSED, which proves
+	// ro_admin_sync() was a known buildin, which proves the hook is compiled
+	// into this map server. No configuration file can fake it, and no
+	// configuration file has to be trusted to report it.
+	query_sql "REPLACE INTO ro_admin_tier2 (id, instance_id, version, poll_ms, last_seen) "
+		+ "VALUES (1, " + .instance + ", '" + .version$ + "', " + .poll_ms + ", NOW())";
+
+	// deletearray before every query_sql destination: query_sql returns early
+	// on a zero-row result WITHOUT touching its destination variables
+	// (src/map/script.cpp:18086-18090), so an emptiness check would otherwise
+	// read whatever was there before. See the longer note in the Tier 1
+	// overlay. deletearray on an array that does not exist is a no-op
+	// (src/map/script.cpp:6561-6563).
+	deletearray .@row;
+	// `action = 'sync_character'` is one half of the queue split; the Tier 1
+	// overlay carries the complementary `action <> 'sync_character'`. Neither
+	// half is optional -- see the INVARIANT at the top of this file.
+	query_sql "SELECT id FROM ro_admin_commands WHERE status = 'pending' "
+		+ "AND action = 'sync_character' ORDER BY id ASC LIMIT 1", .@row;
+	if (getarraysize(.@row) == 0)
+		goto L_Reschedule;
+	.@cmd = .@row;
+
+	// Compare-and-swap, identical in shape to Tier 1's. The UPDATE only fires
+	// on a row still 'pending', and the SELECT only returns it if OUR instance
+	// stamped it. With the split total this always succeeds; if it ever does
+	// not, a second consumer exists and the queue is a coin flip.
+	query_sql "UPDATE ro_admin_commands SET status = 'processing', claimed_by = " + .instance
+		+ ", claimed_at = NOW() WHERE id = " + .@cmd + " AND status = 'pending'";
+	deletearray .@char_id;
+	query_sql "SELECT char_id FROM ro_admin_commands WHERE id = " + .@cmd
+		+ " AND claimed_by = " + .instance, .@char_id;
+	if (getarraysize(.@char_id) == 0) {
+		debugmes "[ro-admin] tier2 LOST RACE for row " + .@cmd + " -- another consumer is on this queue";
+		goto L_Reschedule;
+	}
+
+	.@err$ = "";
+
+	deletearray .@aid;
+	query_sql "SELECT account_id FROM `char` WHERE char_id = " + .@char_id, .@aid;
+	if (getarraysize(.@aid) == 0) {
+		.@err$ = "no such character";
+		goto L_Finish;
+	}
+
+	// Nothing to flush for a character the map server is not holding -- the
+	// stored row is already authoritative. Reported as a refusal rather than
+	// a success, because "already fresh" and "freshly synced" are different
+	// answers and the caller may care which.
+	if (!isloggedin(.@aid, .@char_id)) {
+		.@err$ = "character is not online";
+		goto L_Finish;
+	}
+
+	// The `false` is the force argument and it is load-bearing: omitted it
+	// defaults to TRUE (src/map/script.cpp:13513-13517) and would attach a
+	// player who is mid-conversation with another NPC, swapping their script
+	// state out from under them. With force false the condition is
+	// `sd != nullptr && !sd->npc_id` (src/map/script.cpp:13521), so a busy
+	// player fails the row cleanly and the request can be reissued.
+	if (!attachrid(.@aid, false)) {
+		.@err$ = "could not attach - player is busy in a script or offline";
+		goto L_Finish;
+	}
+	// attachrid can resolve to a session that has already gone away -- seen
+	// when reconnecting quickly. Confirm the identity before flushing it.
+	if (getcharid(0) != .@char_id) {
+		detachrid;
+		.@err$ = "attached session is a different character";
+		goto L_Finish;
+	}
+
+	// Remember the in-memory value BEFORE the flush, so the check below has
+	// something to compare against. Zeny is a readable player parameter
+	// (doc/script_commands.txt:590) backed directly by sd->status.zeny
+	// (src/map/pc.cpp:10180) -- the same idiom, read the same way inside the
+	// attached scope, as the Tier 1 overlay's adjust_zeny branch.
+	.@live_zeny = Zeny;
+
+	// The compiled hook. Returns 0 if no player is attached, or if the char
+	// server is disconnected -- chrif_save bails through chrif_check(-1)
+	// (src/map/chrif.cpp:124,293) and saves nothing, so a bare call would
+	// report a success that never happened.
+	if (!ro_admin_sync()) {
+		detachrid;
+		.@err$ = "sync hook could not flush - char server down or no session";
+		goto L_Finish;
+	}
+
+	// POST-CONDITION, not a return code. chrif_save does not write MySQL: it
+	// queues packet 0x2b01 to the char server (src/map/chrif.cpp:317-328) and
+	// the char server commits afterwards. So the hook returning 1 means
+	// "handed over", never "persisted", and recording a sync time on that
+	// basis would let the API report a row as fresh before it was written.
+	//
+	// Same rule as the Tier 1 overlay: read the state back and compare. Zeny
+	// is the witness because it is one integer, it is the field the staleness
+	// defect was measured on, and it is already in this script's hands.
+	//
+	// Note precisely what this proves, because it is not "a write happened".
+	// It proves that `char`.zeny equals live memory right now -- which is
+	// exactly the claim ro_admin_sync.synced_at makes, and which is also true
+	// in the common case where the row already matched and the flush changed
+	// nothing. That is the honest reading of the check, not a hole in it.
+	//
+	// KNOWN LIMIT: one field is not the whole row. A tick that reaches the
+	// REPLACE below has observed zeny to be current; inventory and cart travel
+	// in the same packet but are not read back, because script has no cheap
+	// way to compare them. synced_at is evidence about the `char` row, and
+	// strongest about the field the API reports staleness on.
+	deletearray .@stored;
+	query_sql "SELECT zeny FROM `char` WHERE char_id = " + .@char_id, .@stored;
+	// Released here, before the comparison, because the hook was the last
+	// thing that needed a session: holding one across the remaining MySQL
+	// round trips would pin the player's own commands behind a script
+	// instance that has already finished its work on them. Every exit below
+	// this line is therefore already detached, and every exit above it that
+	// could be attached detaches inside its own branch -- so exactly one
+	// detachrid runs on every path that attached.
+	detachrid;
+	// `.@stored` with no index is `.@stored[0]`, the same bare-array read the
+	// Tier 1 overlay uses for every query_sql result.
+	if (getarraysize(.@stored) == 0 || .@stored != .@live_zeny) {
+		// Not an error -- the write is in flight and will land shortly.
+		// Failing the row is the honest answer: the caller asked for a
+		// confirmed flush, and re-queueing costs one second.
+		.@err$ = "flush queued but not yet persisted - retry";
+		goto L_Finish;
+	}
+
+	// Only now. synced_at means "the stored row was OBSERVED to match live
+	// memory at this time", which is the claim the API needs in order to
+	// report freshness as evidence rather than as an assumption.
+	query_sql "REPLACE INTO ro_admin_sync (char_id, synced_at) VALUES ("
+		+ .@char_id + ", NOW())";
+
+L_Finish:
+	// Every string written here is a literal from this file, and none of them
+	// contains a quote character. Nothing from the queue is concatenated into
+	// SQL, which is what makes the invariant at the top of this file checkable
+	// rather than aspirational.
+	if (.@err$ == "")
+		query_sql "UPDATE ro_admin_commands SET status = 'executed', finished_at = NOW() "
+			+ "WHERE id = " + .@cmd;
+	else
+		query_sql "UPDATE ro_admin_commands SET status = 'failed', finished_at = NOW(), "
+			+ "error_message = '" + .@err$ + "' WHERE id = " + .@cmd;
+
+L_Reschedule:
+	stopnpctimer;
+	initnpctimer;
+	end;
+}

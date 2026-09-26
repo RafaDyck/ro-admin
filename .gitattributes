@@ -4,5 +4,16 @@
 # checkout, putting a stray \r after `FAKE_NPC,{` and after every label.
 # Pin them to LF so the artifact an operator receives is the artifact that was
 # tested, whatever platform they cloned on.
-overlay/*.txt text eol=lf
-overlay/*.sql text eol=lf
+#
+# The globs below use `**/` and not a bare `/`: a fnmatch `*` does not cross
+# a directory separator, so `overlay/*.txt` covered the Tier 1 overlay and
+# silently missed overlay/tier2/ro_admin_tier2.txt -- the artifact most
+# likely of all of them to be copied onto a Linux server. `a/**/b` matches
+# zero or more intervening directories, so these still cover overlay/ itself.
+overlay/**/*.txt text eol=lf
+overlay/**/*.sql text eol=lf
+
+# Same reason for the Tier 2 hook: these two files are pasted into rAthena's
+# src/custom/ on the build host. g++ tolerates CRLF, but the artifact an
+# operator receives should be byte-for-byte the one that was compile-checked.
+overlay/**/*.inc text eol=lf

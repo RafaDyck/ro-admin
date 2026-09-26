@@ -34,10 +34,18 @@
 //= column, and every error_message written at L_Finish is a
 //= literal from this file containing no quote character.
 //=
-//= INVARIANT: this script is the ONLY consumer of
-//= ro_admin_commands. Rows are claimed with a compare-and-swap
-//= and stamped with .instance so that a second consumer shows
-//= up in the data instead of silently winning races.
+//= INVARIANT: this script is the ONLY consumer of the rows it
+//= claims. Rows are claimed with a compare-and-swap and
+//= stamped with .instance so that a second consumer shows up
+//= in the data instead of silently winning races.
+//=
+//= Tier 2 owns `sync_character` and this script must never
+//= touch it. overlay/tier2/ro_admin_tier2.txt consumes that
+//= action and only that action; the SELECT below excludes it
+//= and only it. The two filters are complements, so every row
+//= has exactly one consumer -- which is the point. This script
+//= would otherwise claim a `sync_character` row, fail it as
+//= `unknown action`, and race Tier 2 for it.
 //=
 //= INVARIANT: a row is stamped 'executed' only after the game
 //= has been observed to do what was asked. rAthena's script
@@ -98,7 +106,23 @@ OnTimer1000:
 	// not silently reprocess the previous row. deletearray on an array that
 	// does not exist is a no-op (src/map/script.cpp:6561-6563).
 	deletearray .@row;
-	query_sql "SELECT id FROM ro_admin_commands WHERE status = 'pending' ORDER BY id ASC LIMIT 1", .@row;
+	// `action <> 'sync_character'` is not a filter for tidiness; it is the
+	// other half of a two-script queue split. Tier 2 (overlay/tier2/
+	// ro_admin_tier2.txt) claims exactly the rows this predicate excludes.
+	// Without it, both scripts see the same `sync_character` row: this one
+	// would win some of the races, fall through its dispatch chain to
+	// `unknown action`, and stamp the row 'failed' for work Tier 2 could have
+	// done -- two consumers on one queue, marking each other's rows finished.
+	// That is the exact failure this project was built to remove, so the split
+	// is written as complementary predicates rather than as an ordering or a
+	// timing assumption, and tests/test_overlay_artifact.py checks both halves.
+	//
+	// The predicate is safe against a queue that has no sync_character rows and
+	// against an API that has never heard of the action: `action` is NOT NULL
+	// (overlay/schema.sql), so `<>` never evaluates to NULL and never silently
+	// drops a row.
+	query_sql "SELECT id FROM ro_admin_commands WHERE status = 'pending' "
+		+ "AND action <> 'sync_character' ORDER BY id ASC LIMIT 1", .@row;
 	if (getarraysize(.@row) == 0)
 		goto L_Reschedule;
 	.@cmd = .@row;

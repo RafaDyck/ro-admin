@@ -11,7 +11,8 @@ operations** applied inside the running game server. Eight routers ship today: `
 including the rAthena script), `accounts` and `characters`
 (reads over the `login` and `char` tables, including a character's inventory), `maps`
 (the server's real map list and its walkable geometry, once imported), and `commands`
-(the Tier 1 queue: item grants and zeny adjustments).
+(the action queue: Tier 1 item grants and zeny adjustments, plus a Tier 2
+`sync_character` that flushes a logged-in character's state to the database).
 
 | Endpoint | Notes |
 |---|---|
@@ -28,22 +29,27 @@ including the rAthena script), `accounts` and `characters`
 | `GET /api/v1/accounts/{account_id}` | One account |
 | `GET /api/v1/accounts/{account_id}/characters` | That account's characters |
 | `GET /api/v1/characters` | Filters: `name` (exact), `account_id`, `online`; `limit`/`offset` |
-| `GET /api/v1/characters/{char_id}` | One character |
+| `GET /api/v1/characters/{char_id}` | One character, with `stale`, `stale_fields` and `synced_at` |
 | `GET /api/v1/characters/{char_id}/inventory` | Inventory, item names resolved server-side |
 | `GET /api/v1/maps` | Search the imported map list: `q` (substring of the name); `limit`/`offset` |
 | `GET /api/v1/maps/{name}` | One map's `width`, `height` and `walkable_cells` |
 | `GET /api/v1/maps/{name}/cell` | What is at one coordinate: the raw rAthena `gat` type plus `walkable`/`shootable`/`water` |
 | `GET /api/v1/maps/{name}/cells` | The whole grid — `width*height` raw bytes, one gat type per cell |
-| `POST /api/v1/commands`, `GET /api/v1/commands/{id}` | Tier 1 only: enqueue an action, poll its outcome. A negative `adjust_zeny` delta destroys value and needs `confirm: true`, enforced in the API rather than asked of the caller |
+| `POST /api/v1/commands`, `GET /api/v1/commands/{id}` | Enqueue an action, poll its outcome. `give_item` and `adjust_zeny` need Tier 1; `sync_character` needs Tier 2, and each is refused 409 when the script that consumes *that* action is not responding. A negative `adjust_zeny` delta destroys value and needs `confirm: true`, enforced in the API rather than asked of the caller |
 | `GET /healthz` | Unauthenticated liveness, and a real database round trip |
 
 **Reads accounts and characters; does not manage them.** The account and character
 endpoints are reads only — nothing in this API edits a `login` or `char` row. There is
 no ban, no password reset, no stat edit and no character deletion, and the only writes
-of any kind go through the game server itself via Tier 1. Account responses serve an
-explicit column allowlist, so no password, pincode or session token is ever in one.
+of any kind go through the game server itself via the overlays. Account responses serve
+an explicit column allowlist, so no password, pincode or session token is ever in one.
 Because the `char` table is a mirror the map server flushes on logout or every
-`autosave_time`, every character response carries `stale` and `stale_fields` saying so.
+`autosave_time`, every character response carries `stale`, `stale_fields` and
+`synced_at` saying so. **`stale` is not a restatement of `online`.** On a Tier 2 install
+`synced_at` is the moment the stored row was *observed* to match the game's live memory,
+and `stale` is false while that observation is under a minute old — evidence rather than
+an assumption. It covers the `char` row and not the inventory, which reports its own
+staleness from `online` alone.
 
 **Is not:** a FluxCP replacement. FluxCP is two products: of its 135 actions, only 49 require
 admin. The other 64% is a player-facing control panel — registration, rankings, donations,
@@ -53,7 +59,10 @@ running FluxCP alongside.
 ## Requires no fork of rAthena
 
 rAthena is consumed unmodified. Everything this tool adds rides rAthena's official extension
-seams. You keep pulling upstream.
+seams — `npc/custom/`, `scripts_custom.conf`, and for Tier 2 the `src/custom/` directory
+upstream ships empty for exactly this purpose. No rAthena file is edited, so nothing here
+conflicts on a `git pull`. Tier 2 is the only part that costs a **rebuild**, and that rebuild
+has to be redone after each pull; Tiers 0 and 1 need none. You keep pulling upstream.
 
 ## Install tiers
 
@@ -61,15 +70,28 @@ seams. You keep pulling upstream.
 |---|---|---|
 | **0 — Database** | Point it at your MySQL. Nothing installed. | **Forensics/logs** — GM commands, zeny, item transactions, per-character timeline — plus **account and character reads** (accounts, characters, inventories), item search and detail, and a health/capability report. The map endpoints are Tier 0 too, but need a one-off import first — see below |
 | **1 — Script overlay** *(shipping)* | Run `overlay/schema.sql`, drop one NPC file in `npc/custom/`, add one line to `scripts_custom.conf`. No recompile. | Item grants and zeny adjustments applied **inside the running game**: the game's own stacking, weight and cap rules; whatever logging the server has enabled; visible without a relog; and an outcome recorded only after the change was read back and confirmed |
-| **2 — Compiled hooks** | Add an `.inc` to `src/custom/`, rebuild. | Custom atcommands and script functions |
+| **2 — Compiled hooks** *(shipping)* | Paste two `.inc` files into `src/custom/`, **rebuild the map server**, run `overlay/tier2/schema.sql`, and drop a second NPC file in. | **A logged-in character's stored row, made true on demand.** `sync_character` flushes what the map server is holding in memory and then reads it back, so `synced_at` is an observation rather than a request — measured live: an in-game `+777` absent from `char.zeny`, then exactly `+777` in it, with no logout |
 
-Tier 0 is fully useful alone. Tier 2 is never required.
+Tier 0 is fully useful alone. Tier 2 is never required — and it is the one tier that
+costs a recompile, so **read its page before deciding to install it.** Without it every
+Tier 0 read and every Tier 1 action behaves exactly as before, `capabilities` reports
+`tier2.available: false` with the install step in `reason`, and a `sync_character` is
+refused 409 rather than queued for a consumer that does not exist.
 
 **Tier 1 install, verification and limits: [`overlay/README.md`](overlay/README.md).**
 Read it before installing — in particular, item grants land in `picklog` on a stock
 rAthena, and zeny changes do not land in `zenylog` unless you have turned `log_zeny`
 on. `GET /api/v1/system/capabilities` reports whether Tier 1 is actually responding,
 from the script's own heartbeat rather than from a config file.
+
+**Tier 2 install, the build traps and its honest limits:
+[`overlay/tier2/README.md`](overlay/tier2/README.md).** Read it before starting the
+rebuild — in particular, `docker compose build` exits 0 on a *failed* rAthena build, a
+parallel `make -j` races and dies, and the Tier 1 overlay must be updated at the same
+time because the two scripts' claim filters are a matched pair. `capabilities` reports
+Tier 2 from the compiled hook's own heartbeat too: the script cannot even parse unless
+the hook is in the running binary, so a heartbeat is evidence about the build rather
+than a setting someone remembered to flip.
 
 ## Map import
 
@@ -153,6 +175,14 @@ Tier 1 adds two tables of its own, both prefixed `ro_admin_`, and one NPC
 script you copy into `npc/custom/` — rAthena's own extension seam. It modifies
 no rAthena file and needs no rebuild. Two `DROP TABLE`s and one line removed
 from `scripts_custom.conf` put everything back.
+
+Tier 2 adds two more `ro_admin_` tables, a second NPC script, and the one thing no
+other part of this project needs: a **rebuild of the map server**. Its two pastes go
+into `src/custom/`, which upstream ships empty for exactly this purpose, so they still
+modify no rAthena file and still survive a `git pull` — but the build does have to be
+redone after one. Restoring the two stub `.inc` files and rebuilding uninstalls it, and
+a map server without the hook simply refuses to load the Tier 2 script and logs why;
+Tier 1 keeps working beside it.
 
 The map import adds a third such table, `ro_admin_maps`, and is the one place
 this project reads a file from the game server. **The service still does not.**

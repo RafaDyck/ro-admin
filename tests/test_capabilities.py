@@ -29,7 +29,12 @@ def test_capabilities_reports_tier_zero_available(client):
     # tier1 depends on whether the overlay script is loaded in THIS lab, so it
     # is asserted by the dedicated tests below rather than pinned here.
     assert isinstance(body["tier1"]["available"], bool)
-    assert body["tier2"]["available"] is False
+    # tier2 was pinned False while it WAS a stub. It is now read from a
+    # heartbeat, so it depends on whether this server's map-server was built
+    # with the compiled hook -- the same reason tier1 is not pinned. What it
+    # reports, and that an unavailable tier2 names its install step, are
+    # asserted on both branches in tests/test_tier2.py.
+    assert isinstance(body["tier2"]["available"], bool)
 
 
 @pytest.mark.integration

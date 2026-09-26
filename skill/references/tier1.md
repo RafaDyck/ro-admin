@@ -1,16 +1,24 @@
-# Tier 1: changing the game, on a server that has the overlay
+# Changing the game, on a server that has the overlay
 
 Read this when the question is about changing the game — granting an item or
-adjusting zeny.
+adjusting zeny — or about making the stored row for a logged-in character true,
+which is `sync_character`, at the end of this file.
 
 
-Two actions, and only two: **grant an item** and **adjust zeny**. They are applied by
-an NPC script running inside the game server, so the game's own rules apply, the
-change is visible to the player immediately, and the server logs it to the extent it
-is configured to. There is no direct-database path and you must not build one.
+Two Tier 1 actions, and only two: **grant an item** and **adjust zeny**. They are
+applied by an NPC script running inside the game server, so the game's own rules
+apply, the change is visible to the player immediately, and the server logs it to the
+extent it is configured to. There is no direct-database path and you must not build
+one.
 
-Tier 1 is optional. Most servers will not have it. Everything below starts with
-finding out.
+A third action, **`sync_character`**, needs **Tier 2** — a compiled hook, so a
+recompiled map server rather than a copied file. It changes nothing in the game: it
+flushes what the map server holds in memory into the database, so a stored value stops
+being a guess. It has its own section at the end and **its own capability check**, and
+a server with Tier 1 refuses it.
+
+Every tier here is optional, and a server may have neither. Everything below starts
+with finding out.
 
 ### Check capabilities first, and relay the reason if it is off
 
@@ -140,7 +148,7 @@ If `overlay_responding` is true, expect at most a few seconds: the overlay drain
 **at most one action per second**, and that is an upper bound rather than a rate. A
 queue of thirty rows takes at least thirty seconds.
 
-### The two actions
+### The two Tier 1 actions
 
 | Action | Body | Bounds |
 |---|---|---|
@@ -235,3 +243,133 @@ evidence — the table exists whether or not anything writes to it.
 Either way, the durable record of **who asked** is `requested_by` on the command row.
 That is true for both actions, and for zeny it is the only such record there is.
 
+## `sync_character` — a Tier 2 action, and a different capability check
+
+`sync_character` makes the **stored row for a logged-in character true**. It changes
+nothing in the game. Use it when the question is "what does this character have *right
+now*" and the character is online, because the `char` table is otherwise a mirror up to
+five minutes behind — see `references/entities.md` for what you may and may not claim
+about a stored value.
+
+### Check `tier2`, not `tier1`
+
+```
+python -m ro_admin.cli get system/capabilities
+```
+
+**The tiers are reported separately and a Tier 1 server does not have this action.**
+Reading `tier1.available` and posting a `sync_character` on the strength of it is the
+mistake this paragraph exists to prevent. The `tier2` object on a server that has it,
+observed:
+
+```json
+"tier2": {
+  "available": true,
+  "reason": "overlay responding, last seen 1s ago",
+  "installed": true,
+  "responding": true,
+  "version": "1"
+}
+```
+
+If `tier2.available` is false, **relay `reason` verbatim and stop**, exactly as for
+Tier 1. Posting anyway returns **409 with the same string**. Tier 2 needs a recompiled
+map server, so the remedy is longer than a file copy and it is not yours to perform:
+
+```
+"tier 2 not installed: run overlay/tier2/schema.sql against this database, then follow overlay/tier2/README.md to compile the hook"
+"tier 2 tables exist but the hook has never reported in: the compiled hook is missing or the script is not loaded -- follow overlay/tier2/README.md (src/custom/script.inc, rebuild map-server, then load overlay/tier2/ro_admin_tier2.txt and @reloadscript)"
+```
+
+A server with Tier 1 and no Tier 2 is a **normal, supported install**. When someone
+asks for a live figure there and cannot have one, say so and offer the two honest
+routes in `references/entities.md` — wait for the character to log out, or ask the
+logs — rather than presenting a stale number as current.
+
+### Enqueue it like any other action
+
+Two fields, and there is nothing else to choose: the hook flushes the whole character,
+not a field.
+
+| Action | Body | Needs |
+|---|---|---|
+| `sync_character` | `{"action":"sync_character","char_id":N}` | Tier 2, and the character online |
+
+```
+python -m ro_admin.cli post commands char_id=150002 action=sync_character
+```
+
+Observed — `202 Accepted`:
+
+```json
+{"id":645,"char_id":150002,"action":"sync_character","status":"pending","requested_by":"admin1234",
+ "created_at":"2026-09-26T18:51:14","claimed_by":null,"finished_at":null,
+ "error_message":null,"overlay_responding":true}
+```
+
+Then poll the id, and read `executed` before claiming anything — the rule above applies
+here unchanged.
+
+### `failed: flush queued but not yet persisted - retry` means RETRY
+
+**This is the one thing in this section that will otherwise be reported wrong.** An
+agent that sees this and tells the operator "the sync failed" is technically accurate
+and practically useless: the answer was "not yet", and one more attempt normally gets
+it.
+
+Observed, both rows from one sequence four seconds apart:
+
+```json
+{"id":640,"char_id":150000,"action":"sync_character","status":"failed","requested_by":"admin1234",
+ "created_at":"2026-09-26T18:49:48","claimed_by":1790447748711,"finished_at":"2026-09-26T18:49:48",
+ "error_message":"flush queued but not yet persisted - retry","overlay_responding":true}
+```
+```json
+{"id":641,"char_id":150000,"action":"sync_character","status":"executed","requested_by":"admin1234",
+ "created_at":"2026-09-26T18:49:52","claimed_by":1790447748711,"finished_at":"2026-09-26T18:49:53",
+ "error_message":null,"overlay_responding":true}
+```
+
+Why it happens: the hook hands the save to the char server and returns — it does not
+write MySQL itself — and the char server commits a moment later. The overlay will not
+record a sync it has not seen land, so it reads the stored value back, finds the write
+still in flight, and fails the row rather than claiming a freshness nobody observed.
+That refusal is the same discipline as `executed` meaning verified.
+
+**So: reissue, up to a small number of times.** Each attempt costs about a second. The
+repeatable measurement in the private lab's `harness/test_tier2.py` needed **two**
+attempts to land a +777; treat three or four consecutive `not yet persisted` rows as a
+real problem and report it, rather than looping.
+
+**Only that exact message means the write is in flight.** Every other `error_message`
+is an answer about this request, and each one says something different about what to do
+next — do not treat them as one "it failed":
+
+| `error_message` | What it means |
+|---|---|
+| `character is not online` | Nothing to flush. The map server is not holding this character, so **the stored row is already authoritative** — which is the answer the caller wanted, not a failure to work around. Read the character and report the row as current. |
+| `no such character` | The `char_id` does not exist. Check the id. |
+| `could not attach - player is busy in a script or offline` | The player is mid-conversation with an NPC and the overlay declined to interrupt them. Reissue in a moment. |
+| `attached session is a different character` | The session the overlay reached is not the character that was asked for — seen when a player reconnects quickly. Reissue once; if it repeats, report it. |
+| `sync hook could not flush - char server down or no session` | The char server is not reachable from the map server. An operator problem; relay it. |
+
+Observed, for the first of those:
+
+```json
+{"id":643,"char_id":200000,"action":"sync_character","status":"failed","requested_by":"admin1234",
+ "created_at":"2026-09-26T18:50:04","claimed_by":1790447748711,"finished_at":"2026-09-26T18:50:04",
+ "error_message":"character is not online","overlay_responding":true}
+```
+
+### What a successful sync licenses you to say, and what it does not
+
+After `executed`, re-read the character. `synced_at` carries the moment the stored row
+was **observed** to match the game's memory, and `stale` is false while that
+observation is under a minute old.
+
+**It is evidence about the `char` row and not about the inventory.**
+`GET /characters/{char_id}/inventory` still reports `stale: true` for an online
+character after a successful sync — observed, in the same second — because nothing
+watched the inventory land. Do not tell anyone an inventory is current because a
+character sync succeeded. `references/entities.md` has the full rule and the observed
+pair.

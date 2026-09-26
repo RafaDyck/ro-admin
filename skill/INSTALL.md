@@ -134,7 +134,7 @@ The eight scopes that exist, in full:
 | `characters.write` | Nothing today — no endpoint requires it |
 | `system.read` | `system/capabilities` and the four map endpoints |
 | `commands.read` | Polling a queued Tier 1 command's outcome |
-| `commands.write` | Enqueueing a Tier 1 item grant or zeny adjustment |
+| `commands.write` | Enqueueing a Tier 1 item grant or zeny adjustment, or a Tier 2 `sync_character` |
 
 A name that is not on that list fails at mint time and names itself:
 

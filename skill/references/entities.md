@@ -43,11 +43,12 @@ python -m ro_admin.cli get characters name=Kami
 ```json
 {"items": [{"char_id": 150000, "account_id": 2000005, "name": "Kami",
             "class": 4013, "base_level": 99, "job_level": 70, "base_exp": 0,
-            "job_exp": 0, "zeny": 10249324, "status_point": 100391,
+            "job_exp": 0, "zeny": 10259425, "status_point": 100391,
             "skill_point": 69, "party_id": 0, "guild_id": 0,
             "last_map": "geffen", "last_x": 52, "last_y": 134, "online": false,
-            "last_login": "2026-08-23T21:30:51", "delete_date": 0,
-            "unban_time": 0, "stale": false, "stale_fields": []}],
+            "last_login": "2026-09-26T18:47:34", "delete_date": 0,
+            "unban_time": 0, "stale": false, "stale_fields": [],
+            "synced_at": "2026-09-26T18:49:53"}],
  "limit": 50, "offset": 0}
 ```
 
@@ -74,47 +75,124 @@ someone asks how many of an item a character holds.
 
 ### The staleness rule — what you are allowed to claim
 
-Every character response carries `stale` and `stale_fields`, present whether true or
-false. Values are always reported and never withheld, because a `null` meaning "we
-chose not to tell you" is indistinguishable from a real zero.
+Every character response carries `stale`, `stale_fields` and `synced_at`, present
+whether true, false or null. Values are always reported and never withheld, because a
+`null` meaning "we chose not to tell you" is indistinguishable from a real zero.
 
 **When `stale` is true, you may not present any field named in `stale_fields` as
-current.** Say that the value may be up to five minutes old, every time you quote
-one.
+current.** Say how old the figure may be, every time you quote one — and read
+`synced_at` before you say it, because that is what tells you.
 
-Observed with that character logged in, trimmed to the fields that matter here:
+Observed on a character that was logged in and had never been synced, trimmed to the
+fields that matter here:
 
 ```json
-{"char_id": 150002, "name": "acct", "zeny": 2131701, "base_level": 200,
- "last_map": "geffen", "online": true, "stale": true,
+{"char_id": 200001, "name": "Brynhild", "zeny": 599248, "base_level": 88,
+ "last_map": "geffen", "online": true, "stale": true, "synced_at": null,
  "stale_fields": ["base_exp", "base_level", "job_exp", "job_level", "last_map",
                   "last_x", "last_y", "skill_point", "status_point", "zeny"]}
 ```
 
-Where the five minutes comes from: `char` and `inventory` are **mirrors** of state
-the map server holds in memory. It does not write through — it flushes on logout, or
-every `autosave_time`, which is 300s by default. Measured: after an in-game +777 zeny
+Where the age comes from: `char` and `inventory` are **mirrors** of state the map
+server holds in memory. It does not write through — it flushes on logout, or every
+`autosave_time`, which is 300s by default. Measured: after an in-game +777 zeny
 change, `char.zeny` was unchanged at t+0s, +2s, +5s, +10s and +20s, then read exactly
 +777 after logout.
 
 So, for the response above:
 
-- Wrong: "acct has 2,131,701 zeny."
-- Right: "the char table records 2,131,701 zeny as of the last save. The character is
-  online, so that figure may be up to five minutes old."
+- Wrong: "Brynhild has 599,248 zeny."
+- Right: "the char table records 599,248 zeny as of the last save. The character is
+  online and has never been synced, so that figure may be up to five minutes old."
 
-If the question genuinely needs a live number there are two honest routes and no
-third:
+#### `stale: false` on an ONLINE character is an observation, and `synced_at` is it
 
-- **The character is offline.** Then `stale` is false, the map server has flushed,
-  and the row is the game's own saved state.
+**`stale` is no longer a restatement of `online`.** It used to be: an online character
+was stale, an offline one was not, and the flag carried no more information than
+`online` already did. On a server with **Tier 2** that is not how it reads any more.
+
+`stale: false` **while `online` is true** means one specific thing: a `sync_character`
+flushed this character and the overlay then **read the stored row back and found it
+equal to the game's live memory**, and that observation is still inside the freshness
+window. It is evidence, not an assumption. `synced_at` is when the observation
+happened, and the window is **60 seconds**.
+
+Observed, seconds after a successful `sync_character` on a character that stayed
+logged in throughout:
+
+```json
+{"char_id": 150002, "name": "acct", "zeny": 2154894, "base_level": 200,
+ "last_map": "geffen", "online": true, "stale": false, "stale_fields": [],
+ "synced_at": "2026-09-26T18:51:15"}
+```
+
+**Report `synced_at`, not just the boolean.** "Not stale" is a yes/no; the timestamp is
+the thing an operator can act on, and it is the only part of the answer that says how
+good the evidence is. The same character, still online and still carrying the same
+`synced_at`, seventy seconds later:
+
+```json
+{"char_id": 150002, "name": "acct", "zeny": 2154894, "base_level": 200,
+ "last_map": "geffen", "online": true, "stale": true,
+ "synced_at": "2026-09-26T18:51:15",
+ "stale_fields": ["base_exp", "base_level", "job_exp", "job_level", "last_map",
+                  "last_x", "last_y", "skill_point", "status_point", "zeny"]}
+```
+
+Nothing changed but the clock. So:
+
+- **`synced_at` null** — nothing has ever verified this row. Either this server has no
+  Tier 2, or nobody has synced this character. Check
+  `system/capabilities` before saying which.
+- **`synced_at` set and `stale` false** — say the figure was verified at that time, and
+  give the time.
+- **`synced_at` set and `stale` true** — the evidence has expired, not vanished. Say
+  when it was verified and that the value may have moved since. A sync would refresh
+  it.
+- **`synced_at` set and `online` false** — `stale` is false here for the older,
+  unrelated reason: the character logged out, so the map server flushed everything and
+  the row is the game's own saved state. Do not credit the sync for that.
+
+`synced_at` never decides `stale` on its own: an offline character is never stale, and
+an online one is fresh only while a verified sync is under a minute old.
+
+#### The evidence covers the `char` row. It does not cover the inventory.
+
+**`GET /characters/{char_id}/inventory` reports `stale` from `online` alone, and Tier 2
+does not change that.** Observed in the same second as the fresh character response
+above — same character, same sync:
+
+```json
+{"char_id": 150002, "stale": true}
+```
+
+The character's `char` row read `stale: false` at that instant; its inventory read
+`stale: true`. That is not an inconsistency to reconcile. The sync does flush the
+inventory, but nothing **watched** it land: the overlay's read-back compares zeny,
+which travels inside the character packet, while the inventory and cart go out through
+a separate earlier call that nobody reads back. There is no `synced_at` on the
+inventory response for exactly that reason — the service has never observed one, so it
+will not imply it has.
+
+**So never tell a user an inventory is current because a character sync succeeded.** If
+they ask whether an item landed, the honest answers are the inventory's own `stale`
+flag, `logs/items` — which rAthena writes when the event happens — or waiting for the
+character to log out.
+
+If the question needs a live figure and Tier 2 is not available, there are two honest
+routes and no third:
+
+- **The character is offline.** Then `stale` is false, the map server has flushed, and
+  the row is the game's own saved state.
 - **Ask the logs instead.** `logs/zeny` and `logs/items` are written by rAthena when
   the event happens rather than on autosave, so "what did they gain today" is a log
   question, not a `char` question. Check first that this server logs the category you
   need — zeny logging ships off, see `references/tier1.md`.
 
-`inventory` carries the same `stale` flag for the same reason: an item granted
-seconds ago may not be in it yet.
+With Tier 2 there is a third: queue a `sync_character` and read the row afterwards. It
+needs the character online, and a first attempt may legitimately come back `failed`
+with `flush queued but not yet persisted - retry`, which means reissue. Both are in
+`references/tier1.md`.
 
 ### `online` here is not "has a live map session"
 
@@ -160,8 +238,8 @@ filesystem, which ro-admin never reads.
 revision and by whatever the operator has customised, and a confidently wrong job
 name is worse than a number. A name is a Tier 1 capability in principle — the game
 server's own `jobname()` resolves exactly this — but Tier 1 today offers only
-`give_item` and `adjust_zeny`, so the honest answer is that no job name is available
-through ro-admin.
+`give_item` and `adjust_zeny`, and Tier 2 only `sync_character`, so the honest answer
+is that no job name is available through ro-admin.
 
 ### Filters and paging
 

@@ -14,8 +14,10 @@ from ro_admin.config import Settings
 from ro_admin.db import Database
 from ro_admin.deps import get_settings, requires
 from ro_admin.permissions import Permission
-from ro_admin.projections import ACCOUNT_COLUMNS, CHARACTER_COLUMNS, select_clause
-from ro_admin.routers.characters import CharacterPage, _to_character
+from ro_admin.projections import ACCOUNT_COLUMNS, select_clause
+from ro_admin.routers.characters import (
+    CharacterPage, _select_characters, _to_character,
+)
 
 router = APIRouter(prefix="/api/v1/accounts", tags=["accounts"])
 
@@ -126,12 +128,17 @@ def account_characters(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"no account with id {account_id}",
         )
-    rows = db.query(
-        f"SELECT {select_clause(CHARACTER_COLUMNS)} FROM `char` "
-        f"WHERE account_id = %s ORDER BY char_num",
-        (account_id,),
-    )
+    # Through the characters router's own reader, so this endpoint reports
+    # freshness the same way GET /characters does. It served the same Character
+    # model from its own bare SELECT before Tier 2, which was harmless while
+    # `stale` was just `online`; with a sync time in the picture it would mean
+    # one character answering "am I stale" two different ways depending on which
+    # endpoint was asked -- and the one that never joined would always say yes.
+    rows = _select_characters(db, "WHERE account_id = %s ORDER BY char_num", (account_id,))
     return CharacterPage(
-        items=[_to_character(r) for r in rows],
+        items=[
+            _to_character(r, synced_at=r.get("synced_at"), now=r.get("db_now"))
+            for r in rows
+        ],
         limit=len(rows), offset=0,
     )

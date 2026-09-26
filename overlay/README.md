@@ -152,6 +152,20 @@ records the outcome on the row. It writes a heartbeat to `ro_admin_overlay` on
 every poll — first, and unconditionally, so that one failing command never
 looks like an uninstalled overlay.
 
+**It does not claim every pending row.** Its SELECT filters
+`action <> 'sync_character'`, because that one action belongs to the Tier 2
+script, which filters `action = 'sync_character'`. The two predicates are
+complements and **both halves are load-bearing**: a copy of this file from
+before Tier 2 existed has no `<>` clause, so on a server running both scripts
+the two race for the same rows and which one wins is a coin flip. That is the
+defect this project was written to remove. If you install Tier 2, copy the
+current version of *this* artifact at the same time — see
+[`tier2/README.md`](tier2/README.md), step 5.
+
+On a server without Tier 2 the filter costs nothing: `sync_character` is
+refused **409** by the API before it can be queued, so there is no row for
+either script to skip.
+
 ### The two actions
 
 | Action | Arguments | Notes |

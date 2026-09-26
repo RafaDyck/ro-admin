@@ -1,13 +1,15 @@
 ---
 name: ro-admin
-description: Use when investigating or administering an rAthena Ragnarok Online server through a ro-admin API — answering questions about what happened to a character, auditing GM commands, tracing zeny or item history, looking up an account or character, reading a character's inventory, searching the server's item database or reading what an item does, listing the server's maps or reading a map's dimensions and walkable geometry, checking which install tiers a server has, or granting an item or adjusting zeny through the Tier 1 overlay. Triggers on questions like "what happened to this character", "who gave that item", "show me the GM commands", "trace this player's zeny", "look up this account", "which characters does this account have", "what is in their inventory", "how much zeny does this character have", "find the item called X", "what is item 501", "what does this item do", "which items are cards", "which maps does this server have", "how big is prontera", "is this coordinate walkable", "find the map called X", "give this player an item", "refund their zeny", or any forensic question about an RO server.
+description: Use when investigating or administering an rAthena Ragnarok Online server through a ro-admin API — answering questions about what happened to a character, auditing GM commands, tracing zeny or item history, looking up an account or character, reading a character's inventory, searching the server's item database or reading what an item does, listing the server's maps or reading a map's dimensions and walkable geometry, checking which install tiers a server has, granting an item or adjusting zeny through the Tier 1 overlay, or flushing a logged-in character's live state to the database through the Tier 2 hook. Triggers on questions like "what happened to this character", "who gave that item", "show me the GM commands", "trace this player's zeny", "look up this account", "which characters does this account have", "what is in their inventory", "how much zeny does this character have", "find the item called X", "what is item 501", "what does this item do", "which items are cards", "which maps does this server have", "how big is prontera", "is this coordinate walkable", "find the map called X", "give this player an item", "refund their zeny", "is that zeny figure current", "sync this character", or any forensic question about an RO server.
 ---
 
 # Administering an rAthena server through ro-admin
 
 `ro-admin` is an administration API over a live rAthena server. Everything in Tier 0
-reads. A server that also has the **Tier 1 overlay** installed accepts two write
-actions, covered in `references/tier1.md`. **The server holds no AI credentials and
+reads. A server that also has the **Tier 1 overlay** accepts two write actions, and one
+with the **Tier 2 compiled hook** as well accepts a third that flushes a logged-in
+character's state to the database. All three are covered in `references/tier1.md`, and
+each tier is reported separately by `system/capabilities`. **The server holds no AI credentials and
 makes no model calls** — you are the intelligence, it is the interface.
 
 ## Setup
@@ -86,7 +88,9 @@ It takes three shapes, each worked through in the reference for its surface:
   applied" — see `references/tier1.md`.
 - **A stored value is not necessarily a current one.** Character and inventory
   rows are mirrors the map server flushes on a timer, and they carry a `stale`
-  flag you are obliged to relay — see `references/entities.md`.
+  flag you are obliged to relay. On a Tier 2 server a character's `stale: false`
+  is an observation with a timestamp, `synced_at`, and it covers the character
+  row and not the inventory — see `references/entities.md`.
 - **Absence of a record is not proof of absence.** An empty search, a log table
   this server does not have, a 404 — each means something narrower than "it did
   not happen", and the reference for the surface says what.
@@ -98,11 +102,13 @@ thing you know, and it is written to be relayed.
 
 ## Boundaries
 
-- **Two write actions, and no more.** `give_item` and `adjust_zeny`, through Tier 1,
-  when the server has it. If asked to do anything else that changes state — ban an
-  account, edit stats, change a password, delete a character — say plainly that
+- **Three actions, and no more.** `give_item` and `adjust_zeny` through Tier 1, and
+  `sync_character` through Tier 2 — each only when `system/capabilities` says that tier
+  is available. `sync_character` changes nothing in the game; it makes the stored row
+  for an online character true. If asked to do anything else that changes state — ban
+  an account, edit stats, change a password, delete a character — say plainly that
   `ro-admin` cannot, and stop. Do not reach around it into the database or another
-  tool, and do not fall back to a direct write when Tier 1 refuses.
+  tool, and do not fall back to a direct write when an overlay refuses.
 - **Never print a token.** The CLI redacts anything JWT-shaped from its own output;
   do not defeat that by echoing `$RO_ADMIN_TOKEN` or pasting one into a summary.
 - **Log data is player data, and so are account and character reads.** Chat logs,
@@ -129,7 +135,7 @@ Read the entry above on every task. Then read only what the question needs.
 | `references/entities.md` | who and what — accounts, characters, inventories, and why a value may be stale |
 | `references/items.md` | finding an item, or reading what one does |
 | `references/maps.md` | the map list, dimensions, or whether a coordinate is walkable |
-| `references/tier1.md` | changing the game — granting an item or adjusting zeny |
+| `references/tier1.md` | changing the game — granting an item or adjusting zeny — or `sync_character`, the Tier 2 action that makes a logged-in character's stored row true |
 
 **Those paths are relative to this file, not to your working directory.** This
 file is `<skill>/SKILL.md` and the references sit in `<skill>/references/`; open

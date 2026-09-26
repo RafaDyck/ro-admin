@@ -1,4 +1,4 @@
-"""Tier 1 command queue.
+"""The command queue.
 
 Two endpoints and one rule: this API reports what the queue row says, and
 never anything more.
@@ -20,6 +20,11 @@ the final answer, not a stale one.
 
 The outcome, whenever it arrives, is written into the row by the only process
 that can actually observe it.
+
+One queue, two consumers, and the split matters to this module: the Tier 2
+script claims `sync_character` rows and the Tier 1 script claims everything
+else. So "is a consumer alive" is a per-action question here, not a global one
+-- see _consumer_status below.
 """
 from datetime import datetime
 from typing import Annotated, Literal, Union
@@ -31,7 +36,8 @@ from ro_admin.config import Settings
 from ro_admin.db import Database
 from ro_admin.deps import Principal, get_settings, requires
 from ro_admin.overlay import (
-    Action, InvalidCommand, enqueue, read_command, read_status,
+    Action, InvalidCommand, OverlayStatus, enqueue, read_command, read_status,
+    read_tier2_status,
 )
 from ro_admin.permissions import Permission
 
@@ -99,7 +105,54 @@ class AdjustZeny(BaseModel):
         return self
 
 
-CommandRequest = Annotated[Union[GiveItem, AdjustZeny], Field(discriminator="action")]
+class SyncCharacter(BaseModel):
+    """Flush a connected character's in-memory state to the database.
+
+    A TIER 2 action: it needs the compiled hook `ro_admin_sync()`, because no
+    script command can make the map server write through. On an install without
+    Tier 2 this is refused with 409 rather than queued -- the Tier 1 script
+    filters `action <> 'sync_character'`, so such a row would sit 'pending'
+    forever with nothing to consume it.
+
+    Takes no arguments beyond the character. There is nothing to choose: the
+    hook flushes the whole mmo_charstatus, not a field.
+
+    A FIRST ATTEMPT MAY LEGITIMATELY COME BACK 'failed' WITH
+    "flush queued but not yet persisted - retry". That is not an error in the
+    request. chrif_save hands packet 0x2b01 to the char server and returns; the
+    char server commits afterwards (src/map/chrif.cpp:317-328). The overlay
+    refuses to record a sync it has not observed, so if the read-back has not
+    landed yet it fails the row and the caller reissues -- which costs one poll
+    interval. Other failures are terminal for a reason the row names: the
+    character is offline (nothing to flush -- the stored row is already
+    authoritative), or busy in another NPC script.
+    """
+    action: Literal["sync_character"]
+    char_id: int = Field(gt=0)
+
+
+CommandRequest = Annotated[
+    Union[GiveItem, AdjustZeny, SyncCharacter], Field(discriminator="action")
+]
+
+
+def _consumer_status(db: Database, action: str) -> OverlayStatus:
+    """The heartbeat of the script that will actually run THIS action.
+
+    The two overlays poll one queue and split it by `action`: Tier 2 claims
+    `sync_character` and nothing else, Tier 1 claims everything else. Both
+    predicates are asserted in tests/test_overlay_artifact.py.
+
+    So a single "is the overlay up" check is the wrong question. Before this
+    was per-action, a `sync_character` posted to a Tier 1-only server passed
+    the guard on Tier 1's heartbeat and was accepted -- and then sat 'pending'
+    forever, because the only script that reads those rows was not there. That
+    dead-queue outcome is the exact thing the guard exists to prevent, and the
+    predecessor's seventy unconsumable rows are what it was written from.
+    """
+    if action == Action.SYNC_CHARACTER:
+        return read_tier2_status(db)
+    return read_status(db)
 
 
 class CommandRow(BaseModel):
@@ -141,9 +194,11 @@ def _row_to_model(row: dict, responding: bool) -> CommandRow:
         "already terminal that is the observed outcome and there is nothing "
         "to wait for. Otherwise poll GET /api/v1/commands/{id}. This endpoint "
         "never reports an outcome it has not observed, which is why the "
-        "status is not normalised to 'pending'. Returns 409 if the overlay "
-        "script is not responding, rather than queueing work that nothing "
-        "will consume."
+        "status is not normalised to 'pending'. Returns 409 if the script that "
+        "consumes THIS action is not responding -- Tier 2's for "
+        "'sync_character', Tier 1's for every other action -- rather than "
+        "queueing work that nothing will consume. The 409 detail names the "
+        "install step that fixes it."
     ),
 )
 def create_command(
@@ -154,7 +209,8 @@ def create_command(
 ) -> CommandRow:
     db = Database(settings)
 
-    overlay = read_status(db)
+    # The tier THIS action needs, not whichever one happens to be up.
+    overlay = _consumer_status(db, body.action)
     if not overlay.usable:
         # Refusing beats accepting. The predecessor's queue held seventy rows
         # that could never succeed, and every one of them was accepted with a
@@ -200,4 +256,8 @@ def get_command(
     row = read_command(db, command_id)
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such command")
-    return _row_to_model(row, read_status(db).responding)
+    # Keyed on the row's own action, for the same reason the 409 guard is:
+    # `overlay_responding` answers "is anything going to pick this up", and for
+    # a sync_character row that is Tier 2's heartbeat. Reporting Tier 1's would
+    # tell a caller polling a stuck sync that its consumer was alive.
+    return _row_to_model(row, _consumer_status(db, row["action"]).responding)

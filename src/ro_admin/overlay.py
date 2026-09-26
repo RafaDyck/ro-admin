@@ -1,4 +1,4 @@
-"""Tier 1 overlay: the command queue and the script that consumes it.
+"""The overlays: the command queue and the scripts that consume it.
 
 The queue carries typed integer arguments, never a command string. The
 predecessor queued text like "@zeny Aldebaran 1000000" and parsed it inside
@@ -8,6 +8,18 @@ substituting a default (the observed case granted 1,000,000 zeny).
 
 Validation happens here, once, before anything is written. The script does no
 parsing at all and therefore has nothing to fall back to.
+
+TWO consumers now poll that one queue -- Tier 1's script and Tier 2's -- and
+they are kept apart by complementary `action` predicates, not by timing. Tier 2
+claims `sync_character` and nothing else; Tier 1 claims everything else. Both
+halves are asserted in tests/test_overlay_artifact.py, because two consumers
+racing one queue is the defect this project was built to remove.
+
+Both tiers announce themselves the same way, through a heartbeat row, so they
+are read and classified by one function rather than two that agree today. What
+differs between them is data -- table names, expected version, and the
+sentences that tell an operator how to install that tier -- and that lives in
+TIER1 and TIER2 below.
 """
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,8 +32,16 @@ from typing import Any, NamedTuple, Protocol
 # but forgets to reload the script is told, rather than left to wonder.
 OVERLAY_VERSION = "1"
 
+# Bumped together with `.version$` in overlay/tier2/ro_admin_tier2.txt, and
+# tracked separately from OVERLAY_VERSION on purpose: the two artifacts are
+# installed independently -- Tier 2 needs a recompiled map server, Tier 1 needs
+# only @reloadscript -- so a change to one must not declare the other stale.
+TIER2_VERSION = "1"
+
 COMMAND_TABLE = "ro_admin_commands"
 HEARTBEAT_TABLE = "ro_admin_overlay"
+TIER2_TABLE = "ro_admin_tier2"
+SYNC_TABLE = "ro_admin_sync"
 
 
 class InvalidCommand(ValueError):
@@ -31,6 +51,9 @@ class InvalidCommand(ValueError):
 class Action(StrEnum):
     GIVE_ITEM = "give_item"
     ADJUST_ZENY = "adjust_zeny"
+    # Tier 2. Consumed by overlay/tier2/ro_admin_tier2.txt, which is the only
+    # consumer of this action and consumes nothing else.
+    SYNC_CHARACTER = "sync_character"
 
 
 class _ArgSpec(NamedTuple):
@@ -74,6 +97,12 @@ _SPECS: dict[Action, tuple[_ArgSpec, ...]] = {
             ),
         ),
     ),
+    # No arguments: the char_id on the row is the whole request. An empty spec
+    # is not a special case in validate() -- the loop simply does not run and
+    # the trailing-zero fill below returns (0, 0), which is what the script
+    # reads past for this action. Asserted in tests/test_overlay.py rather
+    # than assumed.
+    Action.SYNC_CHARACTER: (),
 }
 
 
@@ -135,23 +164,104 @@ class OverlayStatus:
         return self.responding and self.compatible
 
 
+@dataclass(frozen=True)
+class TierSpec:
+    """Everything that differs between the two tiers' heartbeats.
+
+    The classification logic does not differ at all -- "tables missing",
+    "script never ran", "heartbeat too old", "wrong version" are the same four
+    answers for both tiers, calibrated the same way against the script's own
+    poll interval. So there is one classifier and this carries the data.
+
+    A second copy of that logic is the thing worth avoiding: the Tier 1 version
+    was tuned twice already (the poll-derived threshold, then the clock-skew
+    clamp) and a Tier 2 fork would have silently missed both.
+    """
+    # Every table this tier's own schema.sql creates. All of them must exist
+    # before the tier counts as installed: a half-run schema is not an install,
+    # and Tier 2's sync table being absent would make its freshness claim
+    # unanswerable even with a live heartbeat.
+    tables: tuple[str, ...]
+    heartbeat_table: str
+    version: str
+    # Named in the version-mismatch reason. Parameterised rather than fixed
+    # because telling a Tier 2 operator to recopy the Tier 1 script would send
+    # them to change the one file that is not wrong.
+    artifact: str
+    not_installed: str
+    never_ran: str
+    # Closes the "heartbeat too old" reason, because that one observation means
+    # different things for the two tiers and only one of them is answered by
+    # "is the map server running?".
+    #
+    # For Tier 1 that question is the whole diagnosis: the script either loaded
+    # or it did not, and a dead heartbeat points at the map server.
+    #
+    # For Tier 2 it was observed to be actively misleading. Unloading the Tier 2
+    # script in the lab left its last heartbeat row behind, so the tier
+    # classified as stale rather than never-run -- and the API asked "is the map
+    # server running?" in the same response that reported Tier 1 at 0s. The one
+    # fact the reader could already see ruled out the only cause offered. The
+    # other causes are real, specific to this tier, and cost a rebuild to fix,
+    # so the reason has to name them.
+    stale_hint: str = "is the map server running?"
+
+
+TIER1 = TierSpec(
+    tables=(COMMAND_TABLE, HEARTBEAT_TABLE),
+    heartbeat_table=HEARTBEAT_TABLE,
+    version=OVERLAY_VERSION,
+    artifact="overlay/ro_admin_overlay.txt",
+    not_installed="overlay not installed: run overlay/schema.sql against this database",
+    never_ran=(
+        "overlay tables exist but the script has never run: copy "
+        "overlay/ro_admin_overlay.txt into npc/custom/, enable it in "
+        "npc/scripts_custom.conf, then @reloadscript"
+    ),
+)
+
+TIER2 = TierSpec(
+    tables=(TIER2_TABLE, SYNC_TABLE),
+    heartbeat_table=TIER2_TABLE,
+    version=TIER2_VERSION,
+    artifact="overlay/tier2/ro_admin_tier2.txt",
+    not_installed=(
+        "tier 2 not installed: run overlay/tier2/schema.sql against this "
+        "database, then follow overlay/tier2/README.md to compile the hook"
+    ),
+    # The absence of a heartbeat row is the tier detection, not a symptom of
+    # one. A script naming an uncompiled buildin fails to parse, npc_parse_script
+    # drops it (src/map/npc.cpp:4421-4424), and the server runs on with an inert
+    # NPC -- so "no row" means the hook is not in this map server's binary, and
+    # the fix is a recompile, not @reloadscript. Naming the install step is the
+    # difference between a capability report and a shrug.
+    never_ran=(
+        "tier 2 tables exist but the hook has never reported in: the compiled "
+        "hook is missing or the script is not loaded -- follow "
+        "overlay/tier2/README.md (src/custom/script.inc, rebuild map-server, "
+        "then load overlay/tier2/ro_admin_tier2.txt and @reloadscript)"
+    ),
+    stale_hint=(
+        "is the map server running, is overlay/tier2/ro_admin_tier2.txt still "
+        "loaded, and does this build still have the compiled hook? see "
+        "overlay/tier2/README.md"
+    ),
+)
+
+
 def classify_heartbeat(
-    *, tables_present: bool, row: dict | None, now: datetime
+    *, tier: TierSpec, tables_present: bool, row: dict | None, now: datetime
 ) -> OverlayStatus:
     if not tables_present:
         return OverlayStatus(
             installed=False, responding=False, compatible=False,
-            reason="overlay not installed: run overlay/schema.sql against this database",
+            reason=tier.not_installed,
         )
 
     if row is None:
         return OverlayStatus(
             installed=True, responding=False, compatible=False,
-            reason=(
-                "overlay tables exist but the script has never run: copy "
-                "overlay/ro_admin_overlay.txt into npc/custom/, enable it in "
-                "npc/scripts_custom.conf, then @reloadscript"
-            ),
+            reason=tier.never_ran,
         )
 
     poll_ms = int(row["poll_ms"])
@@ -160,14 +270,14 @@ def classify_heartbeat(
     # negative age, and a heartbeat from the future is still a heartbeat.
     age = max(0.0, (now - row["last_seen"]).total_seconds())
     version = str(row["version"])
-    compatible = version == OVERLAY_VERSION
+    compatible = version == tier.version
 
     if age > threshold:
         return OverlayStatus(
             installed=True, responding=False, compatible=compatible,
             reason=(
                 f"overlay script last responded {age:.0f}s ago "
-                f"(stale after {threshold:.0f}s); is the map server running?"
+                f"(stale after {threshold:.0f}s); {tier.stale_hint}"
             ),
             version=version, instance_id=int(row["instance_id"]), age_seconds=age,
         )
@@ -177,7 +287,7 @@ def classify_heartbeat(
             installed=True, responding=True, compatible=False,
             reason=(
                 f"installed overlay is version {version}, this API expects "
-                f"{OVERLAY_VERSION}: copy the current overlay/ro_admin_overlay.txt "
+                f"{tier.version}: copy the current {tier.artifact} "
                 f"and @reloadscript"
             ),
             version=version, instance_id=int(row["instance_id"]), age_seconds=age,
@@ -224,23 +334,30 @@ def read_command(db: _Db, command_id: int) -> dict | None:
     return rows[0] if rows else None
 
 
-def read_status(db: _Db, now: datetime | None = None) -> OverlayStatus:
-    """Ask the database what the overlay is doing, and report only that."""
+def _read_tier(db: _Db, tier: TierSpec, now: datetime | None = None) -> OverlayStatus:
+    """Ask the database what one tier's script is doing, and report only that.
+
+    Shared by both tiers. The placeholders are generated from len(tier.tables),
+    never from the names themselves -- the table names are module constants, but
+    building an IN list by concatenation is the habit this codebase does not
+    have anywhere else and will not acquire here.
+    """
+    placeholders = ", ".join(["%s"] * len(tier.tables))
     present = {
         r["t"].lower()
         for r in db.query(
             "SELECT table_name AS t FROM information_schema.tables "
-            "WHERE table_schema = DATABASE() AND table_name IN (%s, %s)",
-            (COMMAND_TABLE, HEARTBEAT_TABLE),
+            f"WHERE table_schema = DATABASE() AND table_name IN ({placeholders})",
+            tier.tables,
         )
     }
-    tables_present = {COMMAND_TABLE, HEARTBEAT_TABLE} <= present
+    tables_present = set(tier.tables) <= present
 
     row = None
     if tables_present:
         rows = db.query(
             f"SELECT instance_id, version, poll_ms, last_seen, NOW() AS db_now "
-            f"FROM {HEARTBEAT_TABLE} WHERE id = 1"
+            f"FROM {tier.heartbeat_table} WHERE id = 1"
         )
         row = rows[0] if rows else None
 
@@ -250,4 +367,24 @@ def read_status(db: _Db, now: datetime | None = None) -> OverlayStatus:
     if now is None:
         now = row["db_now"] if row else datetime.now()
 
-    return classify_heartbeat(tables_present=tables_present, row=row, now=now)
+    return classify_heartbeat(
+        tier=tier, tables_present=tables_present, row=row, now=now
+    )
+
+
+def read_status(db: _Db, now: datetime | None = None) -> OverlayStatus:
+    """Tier 1: is the queue's consumer alive and speaking this contract."""
+    return _read_tier(db, TIER1, now)
+
+
+def read_tier2_status(db: _Db, now: datetime | None = None) -> OverlayStatus:
+    """Tier 2: is the compiled hook present in the running map server.
+
+    Nothing here trusts a configuration file. A heartbeat row in ro_admin_tier2
+    can only have been written by a script that parsed, and that script names
+    ro_admin_sync() -- an unknown buildin makes parse_script return nullptr
+    (src/map/script.cpp:2503-2518) and npc_parse_script discards it
+    (src/map/npc.cpp:4421-4424), leaving an inert NPC and no row. So the row's
+    existence IS the evidence that the hook is compiled in.
+    """
+    return _read_tier(db, TIER2, now)

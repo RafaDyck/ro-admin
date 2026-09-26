@@ -8,10 +8,16 @@ assuming. Every field here is an observation:
     rewrites on every poll. Not from a config file, not from a path on disk:
     the API cannot see the game server's filesystem, and a file that exists
     is not a script that is running.
+  * Tier 2 is reported the same way, and its heartbeat carries more weight
+    than Tier 1's. Tier 2's script calls a COMPILED buildin, and a script
+    naming an unknown buildin fails to parse and is discarded
+    (src/map/npc.cpp:4421-4424). So a row in ro_admin_tier2 can only exist if
+    the hook is in the running map server's binary -- there is no setting to
+    misreport and no operator claim to take on trust.
 
-Tier 2 remains stubbed; its artifact does not exist yet, and reporting a
-capability we cannot deliver is exactly the failure mode the predecessor had
-when its UI claimed changes were live.
+Reporting a capability we cannot deliver is the failure mode the predecessor
+had when its UI claimed changes were live, so every field here stays an
+observation even when that means saying no.
 """
 from datetime import datetime
 
@@ -21,7 +27,7 @@ from pydantic import BaseModel
 from ro_admin.config import Settings
 from ro_admin.db import Database
 from ro_admin.deps import get_settings, requires
-from ro_admin.overlay import read_status
+from ro_admin.overlay import OverlayStatus, read_status, read_tier2_status
 from ro_admin.permissions import Permission
 from ro_admin.routers.maps import MAPS_NOT_IMPORTED
 
@@ -89,8 +95,14 @@ def _maps(db: Database, present: set[str]) -> Maps:
     )
 
 
-def _tier1(db: Database) -> Tier:
-    status = read_status(db)
+def _tier(status: OverlayStatus) -> Tier:
+    """One mapping for both tiers, so they cannot start answering differently.
+
+    `available` is `usable`, which is responding AND compatible -- a script
+    that is alive but speaking a different contract version is not a
+    capability, and reporting it as one is how an operator ends up debugging a
+    contract change at 2am.
+    """
     return Tier(
         available=status.usable,
         reason=status.reason,
@@ -120,7 +132,11 @@ def capabilities(settings: Settings = Depends(get_settings)) -> Capabilities:
             available=True,
             log_tables=sorted(t for t in KNOWN_LOG_TABLES if t in present),
         ),
-        tier1=_tier1(db),
-        tier2=Tier(available=False, reason="compiled hooks not implemented in this release"),
+        tier1=_tier(read_status(db)),
+        # Two reads rather than one, because the two tiers have separate
+        # heartbeats -- see overlay/tier2/schema.sql for why that separation is
+        # deliberate. A shared row would make either tier's availability
+        # inferable from the other's age, which is not a thing that is true.
+        tier2=_tier(read_tier2_status(db)),
         maps=_maps(db, present),
     )
