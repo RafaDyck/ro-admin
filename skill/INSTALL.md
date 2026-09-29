@@ -101,9 +101,10 @@ A second belt on the same trousers: `issue_service_token` in
 reached it would grant nothing.
 
 You can watch this on a live server. `GET /api/v1/auth/me` with a service token
-reports `{"subject": "agent-readonly", "level": 0}` — the lowest level the enum
-has — while the same token reads `/api/v1/characters` perfectly well. The reads
-come from the scopes. The level grants nothing at all.
+reports `"level": 0` — the lowest level the enum has — and its `permissions`
+list is exactly the token's scopes. The same token reads `/api/v1/characters`
+perfectly well. The reads come from the scopes. The level grants nothing at
+all.
 
 ### Three recipes
 
@@ -127,7 +128,7 @@ The eight scopes that exist, in full:
 
 | Scope | Covers |
 |---|---|
-| `logs.read` | GM commands, zeny, item transactions, per-character timeline, and the three item endpoints |
+| `logs.read` | GM commands, zeny, item transactions, per-character timeline (including its view of the action queue -- reading a queued row's place in history needs only this scope, not `commands.read`), and the three item endpoints |
 | `accounts.read` | The account list and one account |
 | `accounts.write` | Nothing today — no endpoint requires it |
 | `characters.read` | Characters, inventories, **and an account's character list** — that endpoint hangs off `/accounts/` but is guarded as a character read |
@@ -260,7 +261,13 @@ python -m ro_admin.cli get auth/me
 ```json
 {
   "subject": "agent-readonly",
-  "level": 0
+  "level": 0,
+  "permissions": [
+    "logs.read",
+    "accounts.read",
+    "characters.read",
+    "system.read"
+  ]
 }
 ```
 

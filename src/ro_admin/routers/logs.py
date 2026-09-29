@@ -8,9 +8,14 @@ ask.
 atcommandlog has NO surrogate primary key, so ordering is by atcommand_date and
 pagination is limit/offset rather than keyset. Said plainly here so nobody
 assumes stable cursors.
+
+character_timeline() also reads ro_admin_commands, the Tier 1/2 action queue,
+when that table exists -- see the comment above the function for why a queued
+write belongs in the same history as the game's own logs.
 """
 from datetime import datetime
 
+import pymysql
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 
@@ -18,8 +23,12 @@ from ro_admin.config import Settings
 from ro_admin.db import Database
 from ro_admin.deps import get_settings, requires
 from ro_admin.logtypes import decode_pick_type
+from ro_admin.overlay import COMMAND_TABLE
 from ro_admin.routers.items import lookup_names
 from ro_admin.permissions import Permission
+# Same MySQL errno, from one definition rather than a second copy that agrees
+# today -- see maps.py's reasoning for why the guard is this narrow.
+from ro_admin.routers.maps import _ER_NO_SUCH_TABLE
 
 router = APIRouter(prefix="/api/v1/logs", tags=["logs"])
 
@@ -242,9 +251,31 @@ def item_logs(
 # first -- correct, and fine at these volumes. If a deployment ever has log
 # tables large enough for that to hurt, the fix is a UNION ALL in SQL, not a
 # bigger limit here.
+#
+# ro_admin_commands (the Tier 1/2 action queue) is one of these sources, not
+# an afterthought bolted beside them. Reason: on a stock rAthena install
+# log_zeny ships 0 (see overlay/README.md), so adjust_zeny writes no zenylog
+# row at all -- the game's own logs simply cannot show the write an operator
+# is asking "did this take?" about. The queue is the only durable record of
+# that request (kind="queued"), and an empty timeline in front of that
+# question is exactly what invites a double-send. `action <> 'sync_character'`
+# is NOT filtered here, deliberately, unlike the write-detection subquery in
+# characters.py -- sync_character rows are part of this character's own
+# history too, and the operator asking "what happened" is entitled to see
+# that a sync was attempted, same as any other queued action.
 
 
 class TimelineEntry(BaseModel):
+    """One event, from whichever source produced it.
+
+    `summary` is prose for a human (or an agent) to read, not a value to
+    parse -- its wording is not a stable contract, and it can change between
+    releases without notice. `detail` is the authoritative, structured
+    answer: for a `kind="queued"` entry specifically, `detail.status` is the
+    real status ('pending', 'processing', 'executed' or 'failed') and must be
+    what any caller branches on. Never infer status from whether a word like
+    "executed" or "failed" appears in `summary`.
+    """
     date: datetime
     kind: str
     char_id: int
@@ -306,12 +337,44 @@ def character_timeline(
         "WHERE char_id = %s ORDER BY id DESC LIMIT %s",
         (char_id, limit),
     )
+
+    sources = ["atcommandlog", "zenylog", "picklog"]
+    try:
+        command_rows = db.query(
+            f"SELECT id, action, arg_int, arg_int2, status, requested_by, "
+            f"created_at, finished_at, error_message FROM {COMMAND_TABLE} "
+            f"WHERE char_id = %s ORDER BY id DESC LIMIT %s",
+            (char_id, limit),
+        )
+    except pymysql.err.ProgrammingError as exc:
+        # No Tier 1/2 install: the queue never existed, so it is left out of
+        # `sources` rather than listed and answering nothing -- `sources` must
+        # name only the tables actually read, or a caller checking it to
+        # explain an empty timeline would be told a table was consulted that
+        # never was.
+        if exc.args and exc.args[0] == _ER_NO_SUCH_TABLE:
+            command_rows = []
+        else:
+            raise
+    else:
+        sources.append(COMMAND_TABLE)
+
     # Names resolved here too, not just on /logs/items. The timeline is the
-    # endpoint an agent reaches for first, and a summary reading "item 909 x77"
-    # forces the caller to keep its own id-to-name map -- the exact habit the
-    # "no privileged UI knowledge" rule exists to prevent. Caught during the
-    # final end-to-end run, after the rule had already been written down.
-    item_names = lookup_names(db, [r["nameid"] for r in item_rows])
+    # endpoint an agent reaches for first, and a summary (or a `detail`) that
+    # only carries a bare item_id forces the caller to keep its own
+    # id-to-name map -- the exact habit the "no privileged UI knowledge" rule
+    # exists to prevent. Caught during the final end-to-end run, after the
+    # rule had already been written down.
+    #
+    # ONE lookup_names call for BOTH picklog rows and give_item command rows,
+    # not two: they are the same question (what does this item_id mean) asked
+    # of two sources, and item_db has no reason to be queried for it twice in
+    # what is already the same request.
+    item_ids = [r["nameid"] for r in item_rows] + [
+        r["arg_int"] for r in command_rows if r["action"] == "give_item"
+    ]
+    item_names = lookup_names(db, item_ids)
+
     for row in item_rows:
         source = decode_pick_type(row["type"])
         name = item_names.get(row["nameid"], f"item {row['nameid']}")
@@ -326,9 +389,61 @@ def character_timeline(
                     "type_name": source, "map": row["map"]},
         ))
 
+    for row in command_rows:
+        status_text = row["status"]
+        if row["status"] == "failed" and row["error_message"]:
+            status_text = f"{row['status']} ({row['error_message']})"
+        # A row that finished later than it was queued must not read as if it
+        # ran at request time -- the overlay polls at most once a second, but
+        # a queue backlog, a busy player who was retried, or simply reading
+        # this hours later all mean created_at and finished_at can be far
+        # apart. Silent (no suffix) in the common case, where the overlay
+        # finished within the same wall-clock second it claimed the row.
+        if row["finished_at"] is not None and row["finished_at"] != row["created_at"]:
+            status_text = f"{status_text} at {row['finished_at']}"
+
+        # Args by name, per overlay.py's _SPECS ordering (arg_int, then
+        # arg_int2): give_item is (item_id, amount), adjust_zeny is (delta,)
+        # with arg_int2 unused, sync_character takes none. Read there before
+        # changing this -- a mismatch here mislabels what was actually queued.
+        if row["action"] == "give_item":
+            item_id, amount = row["arg_int"], row["arg_int2"]
+            name = item_names.get(item_id, f"item {item_id}")
+            summary = (
+                f"give_item {name} x{amount} requested by "
+                f"{row['requested_by']}: {status_text}"
+            )
+            args = {"item_id": item_id, "item_name": name, "amount": amount}
+        elif row["action"] == "adjust_zeny":
+            delta = row["arg_int"]
+            sign = "+" if delta >= 0 else ""
+            summary = (
+                f"adjust_zeny {sign}{delta} requested by "
+                f"{row['requested_by']}: {status_text}"
+            )
+            args = {"delta": delta}
+        else:
+            # sync_character, and anywhere-forward-compatible with a future
+            # no-argument action: the action name and status already say what
+            # happened, and there is nothing else on the row to name.
+            summary = f"{row['action']} requested by {row['requested_by']}: {status_text}"
+            args = {}
+
+        entries.append(TimelineEntry(
+            date=row["created_at"],
+            kind="queued",
+            char_id=char_id,
+            summary=summary,
+            detail={
+                "id": row["id"], "action": row["action"], "status": row["status"],
+                "requested_by": row["requested_by"], "finished_at": row["finished_at"],
+                "error_message": row["error_message"], **args,
+            },
+        ))
+
     entries.sort(key=lambda e: e.date, reverse=True)
     return TimelinePage(
         items=entries[:limit],
         limit=limit,
-        sources=["atcommandlog", "zenylog", "picklog"],
+        sources=sources,
     )

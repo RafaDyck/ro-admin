@@ -24,7 +24,7 @@ TIER1 and TIER2 below.
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, NamedTuple, Protocol
+from typing import Any, Literal, NamedTuple, Protocol
 
 # Bumped together with `.version$` in overlay/ro_admin_overlay.txt whenever the
 # queue contract changes. The API refuses to report Tier 1 available against a
@@ -54,6 +54,26 @@ class Action(StrEnum):
     # Tier 2. Consumed by overlay/tier2/ro_admin_tier2.txt, which is the only
     # consumer of this action and consumes nothing else.
     SYNC_CHARACTER = "sync_character"
+
+
+# The two values consumer_tier() can return, shared with system.py so
+# ActionCapability.tier is typed against the same set rather than a bare str.
+ConsumerTier = Literal["tier1", "tier2"]
+
+
+def consumer_tier(action: str) -> ConsumerTier:
+    """Which tier's script consumes this action: "tier1" or "tier2".
+
+    The one statement of the split. The two scripts poll one queue and divide
+    it by `action` -- Tier 2 claims `sync_character` and nothing else, Tier 1
+    claims everything else -- so "is anything going to run this" is a question
+    about one tier, and this names which. The command guard and the
+    capabilities report both ask here.
+
+    The two scripts' SQL claim predicates that implement this split are
+    asserted in tests/test_overlay_artifact.py.
+    """
+    return "tier2" if action == Action.SYNC_CHARACTER else "tier1"
 
 
 class _ArgSpec(NamedTuple):

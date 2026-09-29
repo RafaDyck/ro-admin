@@ -33,7 +33,16 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
 REFERENCE_DIRS = [ROOT / "src", ROOT / "tests", ROOT / "scripts"]
 
-ALWAYS_ALIVE = {"app", "main", "router"}
+ALWAYS_ALIVE = {
+    "app", "main", "router",
+    # StaticFiles.file_response(): UIFiles (ro_admin/webui.py) overrides it to
+    # stamp every response with the UI's defensive headers. Starlette's own
+    # StaticFiles.__call__ calls self.file_response(...) by name through
+    # inheritance -- machinery this checker cannot see, since that call lives
+    # in a site-packages file outside REFERENCE_DIRS, the same blind spot
+    # DECORATOR_HINTS exists to cover for pydantic's validators.
+    "file_response",
+}
 # `model_validator` belongs beside `field_validator` for exactly the same
 # reason: pydantic invokes both, and neither is ever called by name. Its absence
 # made commands._destructive_needs_confirmation -- the negative-zeny gate, with

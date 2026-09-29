@@ -5,7 +5,7 @@ import pytest
 
 from ro_admin.overlay import (
     OVERLAY_VERSION, TIER1, TIER2_VERSION, Action, InvalidCommand, OverlayStatus,
-    classify_heartbeat, validate,
+    classify_heartbeat, consumer_tier, validate,
 )
 from ro_admin.overlay import (
     HEARTBEAT_TABLE, TIER2, TIER2_TABLE, enqueue, read_command, read_status,
@@ -235,3 +235,12 @@ def test_tier2_install_instructions_both_name_the_readme():
     reading source code."""
     for reason in (TIER2.not_installed, TIER2.never_ran):
         assert "overlay/tier2/README.md" in reason
+
+
+def test_each_action_names_the_tier_whose_script_consumes_it():
+    """The split the two scripts' claim predicates implement: Tier 2 claims
+    sync_character and nothing else, Tier 1 claims everything else. Both
+    predicates are asserted in tests/test_overlay_artifact.py."""
+    assert consumer_tier(Action.SYNC_CHARACTER) == "tier2"
+    assert consumer_tier(Action.GIVE_ITEM) == "tier1"
+    assert consumer_tier(Action.ADJUST_ZENY) == "tier1"

@@ -10,10 +10,10 @@ nothing here writes to either table.
 
 | Endpoint | Scope | Filters |
 |---|---|---|
-| `accounts` | `accounts.read` | `userid` (exact), `min_group_id`, `limit`, `offset` |
+| `accounts` | `accounts.read` | `userid` (exact), `userid_prefix`, `min_group_id`, `limit`, `offset` |
 | `accounts/{account_id}` | `accounts.read` | — |
 | `accounts/{account_id}/characters` | **`characters.read`** | — |
-| `characters` | `characters.read` | `name` (exact), `account_id`, `online`, `limit`, `offset` |
+| `characters` | `characters.read` | `name` (exact), `name_prefix`, `account_id`, `online`, `limit`, `offset` |
 | `characters/{char_id}` | `characters.read` | — |
 | `characters/{char_id}/inventory` | `characters.read` | — |
 
@@ -113,9 +113,39 @@ was stale, an offline one was not, and the flag carried no more information than
 
 `stale: false` **while `online` is true** means one specific thing: a `sync_character`
 flushed this character and the overlay then **read the stored row back and found it
-equal to the game's live memory**, and that observation is still inside the freshness
-window. It is evidence, not an assumption. `synced_at` is when the observation
+equal to the game's live memory**, that observation is still inside the freshness
+window, and **no queued write has been attempted on this character since**. It is
+evidence, not an assumption — and it is evidence about the queue specifically, not a
+claim that nothing at all touched the character. `synced_at` is when the observation
 happened, and the window is **60 seconds**.
+
+**A write attempted after the sync reopens `stale`, even inside that window, whether or
+not it succeeded.** A `give_item` or `adjust_zeny` that the overlay CLAIMED after
+`synced_at` — moved to `processing`, whether it went on to read `executed` or `failed` —
+means the stored row may have moved again after the evidence was taken, so the sync no
+longer proves what the row looks like now. This is deliberately conservative: a `failed`
+row can still have changed live state first (a partial debit, a `MAX_ZENY` clamp — see
+`references/tier1.md`), and a row still `processing` was claimed before the game was
+touched at all, so waiting for it to finish would be too late. The one exception is
+`sync_character` itself — a sync is the evidence, not a write to check the evidence
+against, so a sync never invalidates itself.
+
+So `stale: false` is never just "was synced recently"; it is "was synced recently, and no
+queued write has been attempted since". This is the scenario the rule exists to prevent:
+an operator sees "verified against the game at T" next to a pre-change zeny figure, right
+beside a command row reading `executed` — which reads as the command not having taken,
+when the truth is the opposite. Do not reconstruct this timing yourself from
+`logs/timeline` or `commands/{id}`; read `stale` and `synced_at` off the character
+response, which already accounts for it.
+
+**A sync landing in the same second as a write is ambiguous, and stays `stale` on
+purpose.** The comparison is second-resolution — `synced_at` is a MySQL `DATETIME` with
+no fractional seconds — so a sync and a write that land in the same wall-clock second
+cannot be ordered against each other, and the API's answer in that case is to stay
+`stale` rather than guess. This is not a bug to work around: if you need a fresh answer
+and hit this, queue another `sync_character` a second or more later, rather than reading
+anything into the tie itself. Do not treat the column's precision as something to
+special-case here.
 
 Observed, seconds after a successful `sync_character` on a character that stayed
 logged in throughout:
@@ -146,15 +176,16 @@ Nothing changed but the clock. So:
   `system/capabilities` before saying which.
 - **`synced_at` set and `stale` false** — say the figure was verified at that time, and
   give the time.
-- **`synced_at` set and `stale` true** — the evidence has expired, not vanished. Say
-  when it was verified and that the value may have moved since. A sync would refresh
-  it.
+- **`synced_at` set and `stale` true** — the evidence has expired, or a queued write
+  was attempted after it; say when it was verified and that the value may have moved
+  since. A sync would refresh it.
 - **`synced_at` set and `online` false** — `stale` is false here for the older,
   unrelated reason: the character logged out, so the map server flushed everything and
   the row is the game's own saved state. Do not credit the sync for that.
 
 `synced_at` never decides `stale` on its own: an offline character is never stale, and
-an online one is fresh only while a verified sync is under a minute old.
+an online one is fresh only while a verified sync is under a minute old AND no queued
+write has been attempted since that sync (processing, executed or failed).
 
 #### The evidence covers the `char` row. It does not cover the inventory.
 
@@ -247,11 +278,26 @@ Both list endpoints take `limit` (1..500, default 50) and `offset`. An out-of-ra
 `limit` is rejected with **422** before any query runs — `accounts?limit=501`
 observed as 422.
 
-**`userid` and `name` are exact matches, not prefix or substring.** Observed:
-`accounts userid=admin` returns account 2 alone and not `admin1234`; `characters
-name=Kam` returns an empty list rather than `Kami`. An empty result is therefore weak
-evidence — consider that you were handed a partial name before reporting that no such
-account or character exists.
+**`userid` and `name` are exact matches.** `accounts userid=admin` returns account 2
+alone and not `admin1234`; `characters name=Kam` returns an empty list rather than
+`Kami`.
+
+**For a partial name, use the prefix filters:**
+
+```
+python -m ro_admin.cli get characters name_prefix=Kam
+python -m ro_admin.cli get accounts userid_prefix=adm
+```
+
+These match from the **start** only: `name_prefix=Kam` finds `Kami`, `name_prefix=ami`
+does not. There is no substring search, because only a prefix can use the database's
+index. An empty prefix result is therefore still weak evidence if you were handed the
+middle of a name. Prefix results are ordered by name or userid. Case sensitivity is
+the database's collation, which is case-insensitive on a default MySQL 8 install.
+
+**Both list endpoints report `has_more`, not a total.** Counting every match costs time
+in proportion to the player base. `has_more: true` means another page exists; narrow
+the prefix or page with `offset`.
 
 `min_group_id` is a floor: `min_group_id=10` returns Staff and above. `account_id` on
 `characters` and the `accounts/{id}/characters` sub-resource answer the same question

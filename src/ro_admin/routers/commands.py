@@ -21,10 +21,10 @@ the final answer, not a stale one.
 The outcome, whenever it arrives, is written into the row by the only process
 that can actually observe it.
 
-One queue, two consumers, and the split matters to this module: the Tier 2
-script claims `sync_character` rows and the Tier 1 script claims everything
-else. So "is a consumer alive" is a per-action question here, not a global one
--- see _consumer_status below.
+One queue, two consumers, and the split matters to this module: which tier's
+script claims a given row is answered in exactly one place,
+overlay.consumer_tier(). So "is a consumer alive" is a per-action question
+here, not a global one -- see _consumer_status below.
 """
 from datetime import datetime
 from typing import Annotated, Literal, Union
@@ -36,8 +36,8 @@ from ro_admin.config import Settings
 from ro_admin.db import Database
 from ro_admin.deps import Principal, get_settings, requires
 from ro_admin.overlay import (
-    Action, InvalidCommand, OverlayStatus, enqueue, read_command, read_status,
-    read_tier2_status,
+    Action, InvalidCommand, OverlayStatus, consumer_tier, enqueue, read_command,
+    read_status, read_tier2_status,
 )
 from ro_admin.permissions import Permission
 
@@ -139,9 +139,9 @@ CommandRequest = Annotated[
 def _consumer_status(db: Database, action: str) -> OverlayStatus:
     """The heartbeat of the script that will actually run THIS action.
 
-    The two overlays poll one queue and split it by `action`: Tier 2 claims
-    `sync_character` and nothing else, Tier 1 claims everything else. Both
-    predicates are asserted in tests/test_overlay_artifact.py.
+    Which tier that is comes from overlay.consumer_tier() -- the one
+    statement of the split; see its docstring for what the two scripts
+    actually claim.
 
     So a single "is the overlay up" check is the wrong question. Before this
     was per-action, a `sync_character` posted to a Tier 1-only server passed
@@ -150,7 +150,7 @@ def _consumer_status(db: Database, action: str) -> OverlayStatus:
     dead-queue outcome is the exact thing the guard exists to prevent, and the
     predecessor's seventy unconsumable rows are what it was written from.
     """
-    if action == Action.SYNC_CHARACTER:
+    if consumer_tier(action) == "tier2":
         return read_tier2_status(db)
     return read_status(db)
 

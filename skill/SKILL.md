@@ -89,8 +89,11 @@ It takes three shapes, each worked through in the reference for its surface:
 - **A stored value is not necessarily a current one.** Character and inventory
   rows are mirrors the map server flushes on a timer, and they carry a `stale`
   flag you are obliged to relay. On a Tier 2 server a character's `stale: false`
-  is an observation with a timestamp, `synced_at`, and it covers the character
-  row and not the inventory — see `references/entities.md`.
+  is an observation with a timestamp, `synced_at` — but only while it holds, so
+  a `give_item`/`adjust_zeny` attempted (claimed) after `synced_at` reopens
+  `stale` — whether it went on to read processing, executed or failed —
+  even though the sync itself is recent, and it covers the character row and
+  not the inventory — see `references/entities.md`.
 - **Absence of a record is not proof of absence.** An empty search, a log table
   this server does not have, a 404 — each means something narrower than "it did
   not happen", and the reference for the surface says what.

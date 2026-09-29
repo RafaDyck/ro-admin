@@ -1,0 +1,15 @@
+{
+  "name": "ro-admin-web-tests",
+  "private": true,
+  "description": "Development only: runs the web UI's unit tests. Nothing here ships; ro-admin installs and runs with Python alone.",
+  "type": "module",
+  "engines": {
+    "node": "^22.13.0 || >=24"
+  },
+  "scripts": {
+    "test": "node --test \"tests/web/**/*.test.js\""
+  },
+  "devDependencies": {
+    "jsdom": "^29.1.1"
+  }
+}

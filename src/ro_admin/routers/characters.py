@@ -21,7 +21,16 @@ WITH TIER 2 INSTALLED, `stale` stops being a restatement of `online`. The Tier
 `char`.zeny back and compares it against live memory, writing
 ro_admin_sync.synced_at only when they match. So synced_at is evidence -- "the
 stored row was OBSERVED to match live memory at this time" -- and a recent one
-makes `stale` false. Without Tier 2 nothing ever writes that table, synced_at
+makes `stale` false -- UNLESS a queued write (give_item, adjust_zeny) was
+ATTEMPTED AFTER that sync. "Attempted", not "executed": overlay/ro_admin_overlay.txt
+and overlay/tier2/ro_admin_tier2.txt both claim a row (status='processing',
+claimed_at=NOW()) BEFORE touching the game, and a row that later reads
+'failed' can still have moved live state first -- adjust_zeny's own comment
+says so for a partial debit (truncated to the balance) or a gain clamped at
+MAX_ZENY. So every claimed row (processing, executed, OR failed) counts as a
+write that needs checking against the sync, not just the ones that finished
+clean; see _to_character and _select_characters below for how that write is
+found and compared. Without Tier 2 nothing ever writes ro_admin_sync, synced_at
 is null, and every answer here is exactly what it was before.
 
 How far that evidence reaches is the delicate part, and it stops at the `char`
@@ -39,7 +48,8 @@ from pydantic import BaseModel, Field
 from ro_admin.config import Settings
 from ro_admin.db import Database
 from ro_admin.deps import get_settings, requires
-from ro_admin.overlay import SYNC_TABLE
+from ro_admin.like import like_literal
+from ro_admin.overlay import COMMAND_TABLE, SYNC_TABLE
 from ro_admin.permissions import Permission
 from ro_admin.projections import (
     CHARACTER_COLUMNS, CHARACTER_VOLATILE, select_clause,
@@ -51,6 +61,32 @@ from ro_admin.routers.items import lookup_names
 from ro_admin.routers.maps import _ER_NO_SUCH_TABLE
 
 router = APIRouter(prefix="/api/v1/characters", tags=["characters"])
+
+
+def _missing_table_error(exc: pymysql.err.ProgrammingError) -> bool:
+    """True for MySQL 1146 (unknown table) -- the one ProgrammingError this
+    file treats as 'the tier isn't installed' rather than a bug. Narrow on
+    purpose: 1054 (unknown column) and 1064 (syntax) are ProgrammingError too,
+    and those are real defects in the SQL below that must keep reaching the
+    500 handler."""
+    return bool(exc.args) and exc.args[0] == _ER_NO_SUCH_TABLE
+
+
+def _missing_table_names(exc: pymysql.err.ProgrammingError, table: str) -> bool:
+    """True when a 1146 names THIS table specifically, not some other one in
+    the same statement -- and not merely a table (or database) whose name
+    happens to CONTAIN this one, e.g. a `ro_admin_sync_test` table on some
+    other install must not be mistaken for `ro_admin_sync`.
+
+    MySQL 8's message is `Table '<database>.<table>' doesn't exist` --
+    verified live against this project's lab database. The table name always
+    appears verbatim right before the closing quote, preceded by the
+    database name and a dot, so matching on `.<table>'` anchors to that exact
+    boundary rather than doing a bare substring check, which is what lets
+    _select_characters skip a retry that is guaranteed to fail the same way a
+    second time without also skipping it for the wrong table.
+    """
+    return len(exc.args) > 1 and f".{table}'" in str(exc.args[1])
 
 # How long a verified sync keeps a character's row out of `stale`.
 #
@@ -116,9 +152,16 @@ class Character(BaseModel):
             "old is more useful than absent -- but they are not live. False "
             "when the character is offline (nothing is holding newer state, so "
             "the row is authoritative), and false on a Tier 2 install when "
-            "synced_at is recent, because then the row was OBSERVED to match "
-            "memory. stale_fields is derived from this flag and cannot "
-            "contradict it: when this is false the list is empty."
+            "synced_at is recent AND no queued write (give_item, adjust_zeny) "
+            "has been ATTEMPTED since -- because then, and only then, the row "
+            "was OBSERVED to match memory and nothing has since tried to move "
+            "it. 'Attempted' and not 'executed': the overlay claims a row "
+            "before touching the game, and a row that later reads 'failed' "
+            "can still have changed live zeny first (a partial debit or a "
+            "MAX_ZENY clamp), so a claimed write counts here whether it "
+            "finished 'processing', 'executed' or 'failed'. stale_fields is "
+            "derived from this flag and cannot contradict it: when this is "
+            "false the list is empty."
         )
     )
     stale_fields: list[str]
@@ -140,7 +183,10 @@ class Character(BaseModel):
             "(src/map/chrif.cpp:299-302) that nothing reads back, which is why "
             "GET /characters/{char_id}/inventory reports its own staleness. "
             "Reported even when stale is true -- when the evidence went stale "
-            "is still worth knowing."
+            "is still worth knowing. A non-null value here does NOT by itself "
+            "mean stale is false: a write ATTEMPTED after this timestamp "
+            "reopens staleness even though the sync itself is recent, whether "
+            "or not that write finished successfully -- see stale."
         ),
     )
 
@@ -151,6 +197,13 @@ class CharacterPage(BaseModel):
     items: list[Character]
     limit: int
     offset: int
+    has_more: bool = Field(
+        description=(
+            "Whether a further page exists. Reported instead of a total: "
+            "counting has to visit every match, so its cost grows with the "
+            "player base, while this costs one extra row."
+        )
+    )
 
 
 class InventoryEntry(BaseModel):
@@ -176,12 +229,15 @@ class Inventory(BaseModel):
 
 
 def _to_character(
-    row: dict, synced_at: datetime | None = None, now: datetime | None = None
+    row: dict,
+    synced_at: datetime | None = None,
+    now: datetime | None = None,
+    written_at: datetime | None = None,
 ) -> Character:
-    """Both new arguments are optional, and their absence is the pre-Tier-2
-    answer: no evidence, so an online character is stale. That is not a
-    convenience for callers, it is the correct default -- an install without
-    Tier 2 has nothing that could have observed the row.
+    """All three new arguments are optional, and their absence is the
+    pre-Tier-2 answer: no evidence, so an online character is stale. That is
+    not a convenience for callers, it is the correct default -- an install
+    without Tier 2 has nothing that could have observed the row.
 
     `now` must come from the SAME CLOCK as synced_at, which means the database's
     -- synced_at is a MySQL DATETIME with no timezone, written by NOW() inside
@@ -189,6 +245,27 @@ def _to_character(
     machine. Callers pass the `NOW()` the same SELECT returned. Using
     datetime.now() here instead would let a two-minute skew either report a
     year-old sync as fresh or a one-second-old sync as stale, silently.
+
+    `written_at` is when this character's most recently ATTEMPTED
+    give_item/adjust_zeny row moved (or may have moved) live state -- None
+    means no known write, which is also the pre-Tier-2 default (and the
+    default before write evidence was added here). "Attempted" rather than
+    "executed" on purpose: both overlay
+    scripts claim a row (status='processing', claimed_at=NOW()) strictly
+    before the game is touched, and a row that ends 'failed' can still have
+    changed live zeny first -- adjust_zeny's own post-condition comment notes
+    a partial debit (truncated to the balance) and a MAX_ZENY clamp as cases
+    where the row fails but zeny moved anyway. So `written_at` is read off
+    every claimed row (processing, executed, or failed), using
+    COALESCE(finished_at, claimed_at) so a still-'processing' row -- no
+    finished_at yet -- is still counted, from the moment it was claimed. This
+    only ever errs toward MORE staleness, never less: a failed write that
+    never touched the game (character offline, player busy) still counts and
+    can hold `stale` true until the next sync, which is the safe direction to
+    be wrong in. It comes from the same correlated subquery, off the same
+    MySQL clock, as `now` and `synced_at` -- see _select_characters -- so
+    comparing it against synced_at directly is legitimate for the same reason
+    comparing now against synced_at is.
     """
     online = bool(row["online"])
 
@@ -201,10 +278,27 @@ def _to_character(
         # anyway, a sync from a moment ago is still a sync and must not read as
         # 300 seconds stale.
         age = max(0.0, (now - synced_at).total_seconds())
-        fresh = age <= FRESH_WITHIN_SECONDS
+        within_window = age <= FRESH_WITHIN_SECONDS
+
+        # A queued write ATTEMPTED after the sync means the row may have moved
+        # again after the evidence was taken: the sync proves what the row
+        # looked like at synced_at, not what it looks like now. Without this,
+        # an operator could see "verified against the game at T" beside a
+        # pre-change zeny sitting right next to "executed" -- the founding
+        # incident (src/ro_admin/routers/characters.py's module docstring) in
+        # reverse: the row would look fresh and wrong instead of stale and
+        # honest. `written_at` excludes sync_character rows -- a sync IS the
+        # evidence, not a write that needs to be checked against it.
+        #
+        # A strict `>`: a sync and a write landing in the same wall-clock
+        # second are ambiguous about which happened first, and staying stale
+        # is the safe answer either way.
+        not_undone_by_a_later_write = written_at is None or synced_at > written_at
+
+        fresh = within_window and not_undone_by_a_later_write
 
     # Offline is not stale: nothing is holding newer state, so the stored row is
-    # authoritative and a sync time is irrelevant to it.
+    # authoritative and a sync time (or a write time) is irrelevant to it.
     stale = online and not fresh
     return Character(
         online=online,
@@ -220,9 +314,10 @@ def _to_character(
 
 
 def _select_characters(
-    db: Database, suffix: str, params: list | tuple
+    db: Database, suffix: str, params: list | tuple, order_by: str | None = None
 ) -> list[dict]:
-    """Read `char` rows with each one's verified sync time, if there is one.
+    """Read `char` rows with each one's verified sync time and latest write,
+    if there is one of either.
 
     A LEFT JOIN, not an inner one: a character that has never been synced -- or
     an install where nothing ever syncs -- must still be returned. `USING
@@ -230,34 +325,175 @@ def _select_characters(
     `char_id` stays unambiguous in the select list and the ORDER BY (an
     unqualified one across the join is MySQL error 1052).
 
-    AND THE JOIN MUST NOT BE LOAD-BEARING. ro_admin_sync only exists on a Tier 2
-    install, and on any other install every endpoint here has to answer exactly
-    as it did before Tier 2 was written -- so a missing table falls back to the
-    plain query, and the rows then simply have no synced_at for _to_character to
-    read.
+    WHEN order_by IS GIVEN, `char` IS PAGED BEFORE THE JOIN, not after. The
+    naive shape -- join first, then ORDER BY/LIMIT on the joined result --
+    hands ordering to the optimizer, and once ro_admin_sync is small (true of
+    almost any real install) MySQL is liable to plan it as a hash join: read
+    every WHERE-matching row, join it, sort the lot, and only THEN apply
+    LIMIT -- throwing away the index order the range scan gave it for free.
+    Measured: 139 ms -> 0.26 ms for an 83,333-match `K%` prefix on 1,000,000
+    characters with 3 synced rows; the default list (ORDER BY char_id) 999 ms
+    -> 0.12 ms the same way. So `suffix` carries its own complete
+    WHERE/ORDER BY/LIMIT/OFFSET and is run first, inside a derived table that
+    `char` alone can satisfy straight from its index; the sync join is then
+    applied to at most one page of rows. The outer ORDER BY repeats the same
+    column because a JOIN does not preserve a derived table's row order --
+    omitting it would leave the response order unspecified again.
+
+    order_by IS None for a read that never had a LIMIT worth protecting --
+    get_character's single row by primary key, and account_characters'
+    unlimited per-account listing (already bounded by character_slots, a
+    handful of rows). There the join stays the old, flat shape: there is no
+    over-fetch for paging-first to avoid.
+
+    WRITTEN_AT is a correlated subquery over ro_admin_commands, added to the
+    outer SELECT in both shapes -- in the paged form it runs over the already
+    paged derived table `c`, exactly like the sync join, so it still costs at
+    most one page's worth of correlated lookups rather than one per match.
+    `action <> 'sync_character'` because a sync is the evidence itself, not a
+    write that needs to be checked against it (see _to_character). It answers
+    a DIFFERENT question from the sync join -- "was this row written after the
+    evidence was taken" rather than "is there evidence at all" -- so it is not
+    folded into that join; a character can have a write with no sync, a sync
+    with no write, both, or neither. It reads `status IN (...)` and
+    `COALESCE(finished_at, claimed_at)`, not just `status = 'executed'` and
+    `finished_at` -- see written_at_sql()'s own docstring below for why a
+    claimed-but-not-yet-successful row still counts.
+
+    THE SUBQUERY'S OWN INDEX is overlay/schema.sql's `idx_char_status
+    (char_id, status, action, finished_at, claimed_at)`, not the narrower
+    `idx_char_id (char_id, id)` the paged-join reordering above first shipped
+    with. Measured in this
+    project's lab, where one character's rows dominate the table (86% of
+    1,402 rows belong to one char_id): EXPLAIN ANALYZE on `idx_char_id` reads
+    every one of that character's rows via a non-covering index lookup and
+    then filters status/action against the base row (~1ms observed); an index
+    that also carries status, action, finished_at and claimed_at lets MySQL
+    answer the whole subquery as a covering range scan with no base-row reads
+    at all (~0.4ms observed, and a much bigger win as the table grows,
+    because it is the base-row I/O that scales with row count, not the index
+    scan). `idx_char_id` stays -- the timeline's queue query (`GET
+    /logs/timeline`) still ORDERs BY id on it, and a status-only or
+    char_id-only index does not serve that.
+
+    AND NEITHER THE JOIN NOR THE SUBQUERY MAY BE LOAD-BEARING. ro_admin_sync
+    and ro_admin_commands are independent Tier 2/Tier 1 artifacts -- an install
+    can have one table without the other, e.g. a hand-built Tier 2 with no
+    command queue -- and on any install missing either, every endpoint here
+    has to answer exactly as it did before that table existed. So a missing
+    table is retried with successively less of the query rather than treated
+    as an error:
+
+      1. sync join + written_at subquery (both tables present);
+      2. sync join alone, written_at always None (ro_admin_commands missing --
+         a missing command queue must not also erase ro_admin_sync's
+         evidence, since that table answers an unrelated question);
+      3. the plain `char`-only query (ro_admin_sync missing too, or a Tier 0
+         install with neither).
+
+    Stage 2 is SKIPPED, straight to stage 3, when the 1146 from stage 1 names
+    ro_admin_sync itself rather than ro_admin_commands: retrying the sync-only
+    query would just fail the identical way a second time, since it still
+    joins the table that is not there, and written_at is meaningless without a
+    synced_at to compare it against anyway. Skipping it matters because "no
+    Tier 2" (Tier 0, or Tier 1 without Tier 2) is the common case, not the
+    exception -- see _missing_table_names().
 
     Caught from the query rather than pre-checked against information_schema,
     for the reasons routers/maps.py gives: a pre-check costs a round trip on
     EVERY request and still races a DROP between the two statements. The errno
-    guard is what makes that safe to catch -- 1054 (unknown column) and 1064
-    (syntax) are ProgrammingError too, and those are bugs in this file that must
-    keep reaching the 500 handler rather than being silently answered without a
-    sync time.
+    guard is what makes that safe to catch at each stage -- 1054 (unknown
+    column) and 1064 (syntax) are ProgrammingError too, and those are bugs in
+    this file that must keep reaching the 500 handler rather than being
+    silently answered with less evidence than the schema actually offers.
 
-    The failed statement costs a round trip, but only on an install that does
-    not have the table, and only until it does.
+    A failed statement costs a round trip, but only on an install missing that
+    table, and (after the stage-2 skip above) at most once per request even
+    when the missing table is ro_admin_sync itself.
     """
     columns = select_clause(CHARACTER_COLUMNS)
-    try:
-        return db.query(
-            f"SELECT {columns}, {SYNC_TABLE}.synced_at, NOW() AS db_now "
-            f"FROM `char` LEFT JOIN {SYNC_TABLE} USING (char_id) {suffix}",
-            params,
+
+    def written_at_sql(char_ref: str) -> str:
+        """The correlated write-evidence subquery. `char_ref` is filled in per
+        shape below: the paged form correlates against the derived table's
+        alias (`c.char_id`), the flat form against `char` itself
+        (`` `char`.char_id ``) -- USING coalesces the join's char_id, so inside
+        a subquery, which has its own FROM, only the qualified table name
+        still reaches the outer row.
+
+        `status IN ('processing', 'executed', 'failed')`, not
+        `= 'executed'`: both overlay scripts claim a row -- status moves to
+        'processing', claimed_at = NOW() -- strictly BEFORE the game is
+        touched (overlay/ro_admin_overlay.txt and
+        overlay/tier2/ro_admin_tier2.txt, both right after the compare-and-
+        swap UPDATE). A row that later reads 'failed' can still have changed
+        live state first: adjust_zeny's own post-condition comment names a
+        partial debit (truncated to the balance the player has) and a
+        MAX_ZENY clamp on a gain as cases where the write fails but zeny
+        moved anyway. Excluding 'pending' is what still lets an UNCLAIMED
+        row -- nothing has touched the game for it yet -- leave written_at
+        alone.
+
+        `COALESCE(finished_at, claimed_at)`, not `finished_at` alone: a row
+        still 'processing' has no finished_at yet, and claimed_at -- stamped
+        before the game is touched, same as above -- is the earliest honest
+        time it might have written. This can only make written_at EARLIER
+        than the row's real write (or, for a row that never reached the game
+        at all -- character offline, player busy in another script -- a time
+        nothing actually happened), never later. That is the safe direction:
+        the worst it costs is a character staying `stale` until the next
+        sync, never a stale write being reported fresh.
+        """
+        return (
+            f"(SELECT MAX(COALESCE(cmd.finished_at, cmd.claimed_at)) "
+            f"FROM {COMMAND_TABLE} cmd WHERE cmd.char_id = {char_ref} "
+            f"AND cmd.status IN ('processing', 'executed', 'failed') "
+            f"AND cmd.action <> 'sync_character') AS written_at"
         )
+
+    if order_by is not None:
+        base = (
+            f"FROM (SELECT {columns} FROM `char` {suffix}) AS c "
+            f"LEFT JOIN {SYNC_TABLE} USING (char_id) "
+        )
+        with_written_at = (
+            f"SELECT c.*, {SYNC_TABLE}.synced_at, "
+            f"{written_at_sql('c.char_id')}, NOW() AS db_now "
+            f"{base}ORDER BY {order_by}"
+        )
+        sync_only = (
+            f"SELECT c.*, {SYNC_TABLE}.synced_at, NOW() AS db_now "
+            f"{base}ORDER BY {order_by}"
+        )
+    else:
+        base = f"FROM `char` LEFT JOIN {SYNC_TABLE} USING (char_id) {suffix}"
+        with_written_at = (
+            f"SELECT {columns}, {SYNC_TABLE}.synced_at, "
+            f"{written_at_sql('`char`.char_id')}, "
+            f"NOW() AS db_now {base}"
+        )
+        sync_only = f"SELECT {columns}, {SYNC_TABLE}.synced_at, NOW() AS db_now {base}"
+
+    plain = f"SELECT {columns} FROM `char` {suffix}"
+
+    try:
+        return db.query(with_written_at, params)
     except pymysql.err.ProgrammingError as exc:
-        if exc.args and exc.args[0] == _ER_NO_SUCH_TABLE:
-            return db.query(f"SELECT {columns} FROM `char` {suffix}", params)
-        raise
+        if not _missing_table_error(exc):
+            raise
+        if _missing_table_names(exc, SYNC_TABLE):
+            # ro_admin_sync is the table that is missing, not ro_admin_commands
+            # -- retrying `sync_only` (which still joins ro_admin_sync) would
+            # fail the identical way a second time, and written_at means
+            # nothing without a synced_at to compare it against regardless.
+            # Go straight to the plain query.
+            return db.query(plain, params)
+        try:
+            return db.query(sync_only, params)
+        except pymysql.err.ProgrammingError as exc2:
+            if _missing_table_error(exc2):
+                return db.query(plain, params)
+            raise
 
 
 @router.get(
@@ -268,6 +504,18 @@ def _select_characters(
 )
 def list_characters(
     name: str | None = Query(default=None, description="Exact match"),
+    name_prefix: str | None = Query(
+        default=None, min_length=1, max_length=30,
+        description=(
+            "Names beginning with this text, ordered by name. Served by "
+            "rAthena's own unique index on `char`.`name` as a range scan, so it "
+            "stays fast at any number of characters. Case sensitivity follows "
+            "the database collation (case- and accent-insensitive on a MySQL 8 "
+            "default install). There is deliberately no substring search: a leading "
+            "wildcard cannot use the index, and was measured at 1,452 ms per "
+            "query on 1,000,000 characters."
+        ),
+    ),
     account_id: int | None = Query(default=None, ge=1),
     online: bool | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
@@ -279,6 +527,9 @@ def list_characters(
     if name is not None:
         clauses.append("name = %s")
         params.append(name)
+    if name_prefix is not None:
+        clauses.append("name LIKE %s ESCAPE '\\\\'")
+        params.append(like_literal(name_prefix) + "%")
     if account_id is not None:
         clauses.append("account_id = %s")
         params.append(account_id)
@@ -286,19 +537,27 @@ def list_characters(
         clauses.append("online = %s")
         params.append(1 if online else 0)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    params.extend([limit, offset])
+    # By the searched column when there is one, so the index returns rows
+    # already in order and LIMIT stops the scan after one page. By id
+    # otherwise, as before.
+    order = "name" if name_prefix is not None else "char_id"
+    # One row past the page answers "is there more" without a COUNT(*).
+    params.extend([limit + 1, offset])
 
     rows = _select_characters(
-        db, f"{where} ORDER BY char_id LIMIT %s OFFSET %s", params
+        db, f"{where} ORDER BY {order} LIMIT %s OFFSET %s", params, order_by=order
     )
     return CharacterPage(
         items=[
             # .get() rather than [], because the no-Tier-2 fallback returns rows
             # that have neither column.
-            _to_character(r, synced_at=r.get("synced_at"), now=r.get("db_now"))
-            for r in rows
+            _to_character(
+                r, synced_at=r.get("synced_at"), now=r.get("db_now"),
+                written_at=r.get("written_at"),
+            )
+            for r in rows[:limit]
         ],
-        limit=limit, offset=offset,
+        limit=limit, offset=offset, has_more=len(rows) > limit,
     )
 
 
@@ -320,7 +579,10 @@ def get_character(
             detail=f"no character with id {char_id}",
         )
     row = rows[0]
-    return _to_character(row, synced_at=row.get("synced_at"), now=row.get("db_now"))
+    return _to_character(
+        row, synced_at=row.get("synced_at"), now=row.get("db_now"),
+        written_at=row.get("written_at"),
+    )
 
 
 @router.get(

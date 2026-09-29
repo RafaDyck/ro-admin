@@ -261,7 +261,19 @@ not rely on either -- it reads the inventory back and compares. That is why.
   NPC. Such a row fails cleanly with `could not attach - player is busy in a
   script or offline`, and can simply be reissued.
 - Enqueueing requires `commands.write`, which is level 99 (Admin). Reading a
-  command's outcome requires `commands.read`, level 10 (Staff).
+  command's outcome directly, via `GET /api/v1/commands/{id}`, requires
+  `commands.read`, level 10 (Staff).
+- **`GET /api/v1/logs/timeline` also exposes this queue, under `logs.read`, not
+  `commands.read`.** Every command row this character has -- `requested_by`,
+  the action and its arguments (an item id and amount, or a zeny delta), and
+  any `error_message` -- appears there as a `kind="queued"` entry once Tier 1
+  or Tier 2 is installed, to whichever token holds `logs.read` alone. This is
+  deliberate (the whole point is that History has to show these writes, see
+  `references/forensics.md`), but it does widen who can see `requested_by`
+  and queued arguments: a token scoped to `logs.read` without `commands.read`
+  could not previously see any of this. If your deployment relies on
+  `commands.read` to gate who learns who queued what, `logs.read` now needs
+  the same trust boundary.
 
 ## Uninstall
 
@@ -285,3 +297,24 @@ poll, with no reload.
 The script declares a version, and the API refuses to report Tier 1 available
 against a version it does not expect -- so copying a new release and forgetting
 to `@reloadscript` tells you, rather than failing strangely later.
+
+**Existing installs need two indexes added by hand.** `schema.sql` is
+`CREATE TABLE IF NOT EXISTS`, which creates `ro_admin_commands` correctly on a
+fresh install but will not alter one that already exists -- so an install from
+before these lines were added needs them applied directly:
+
+    ALTER TABLE ro_admin_commands ADD INDEX idx_char_id (char_id, id);
+    ALTER TABLE ro_admin_commands ADD INDEX idx_char_status (char_id, status, action, finished_at, claimed_at);
+
+`idx_char_id` serves the queued rows in `GET /logs/timeline` (`ORDER BY id`).
+`idx_char_status` serves the write-evidence subquery behind `stale` on
+`GET /characters/{char_id}` -- `idx_char_id` alone is not enough for it, since
+that subquery filters on `status` and `action` too and needs both in the index
+to stay a covering scan; see the comment above `idx_char_status` in
+`schema.sql` for the measurement that decided its column order. Without either
+index, the corresponding read falls back to scanning every one of that
+character's rows in `ro_admin_commands`, or the whole table, instead of a
+narrow index range scan. Both features keep working either way; this is a
+cost, not a correctness issue. Safe to run while the overlay script is live:
+each is a plain `ADD INDEX`, not a column change, and `ro_admin_commands` is
+small enough on any real install that the table is locked only briefly.

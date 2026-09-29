@@ -49,13 +49,14 @@ can either — `chrif_save()` has no script binding on a stock rAthena, and
 |---|---|---|
 | Stored row for an **offline** character | Authoritative | Authoritative (unchanged) |
 | Stored row for an **online** character | Up to `autosave_time` (300s) behind | Can be flushed on demand |
-| What the API can say about it | `stale: true` — "this character is online, so these fields may be behind" | `synced_at`, and `stale: false` while that observation is fresh |
+| What the API can say about it | `stale: true` — "this character is online, so these fields may be behind" | `synced_at`, and `stale: false` while that observation is fresh and no queued write has been attempted since |
 | Basis for that answer | An assumption from `online` | An observation: the stored row was **compared** against live memory |
 
 The API side of this is `synced_at` on every character response, and a `stale`
 flag derived from it. `stale` goes false only while `synced_at` is within 60
-seconds **and** the character is online; an offline character is never stale,
-because nothing is holding newer state.
+seconds **and** the character is online **and** no `give_item`/`adjust_zeny`
+has been claimed since (processing, executed or failed); an offline character
+is never stale, because nothing is holding newer state.
 
 The fields this covers are the ones the map server holds in memory:
 `zeny`, `base_level`, `job_level`, `base_exp`, `job_exp`, `status_point`,

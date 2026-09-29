@@ -22,7 +22,11 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 # importers/ is scanned too: it is the one place that reads the game server's
 # files, so it is exactly where a hardcoded fallback map list would be added
 # "just until the import runs" and then never removed.
-SCAN = [ROOT / "src", ROOT / "web", ROOT / "importers"]
+#
+# The web UI ships as package data in src/ro_admin/web/, so `src` covers it.
+# Node's dev-only node_modules/ sits at the repository root, outside every
+# root listed here, so it is never scanned -- rather than scanned and excluded.
+SCAN = [ROOT / "src", ROOT / "importers"]
 SUFFIXES = {".py", ".ts", ".tsx", ".js", ".jsx"}
 ENTRY = re.compile(r"^\s*\"?\d+\"?\s*:\s*[\{\"']")
 THRESHOLD = 20  # consecutive-ish numeric-key entries in one file

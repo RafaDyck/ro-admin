@@ -1,0 +1,185 @@
+/* Plain and legible. A visual design system is deferred (see the spec); this
+   is the floor: readable in light and dark, usable at phone width, and long
+   player-chosen strings wrap instead of widening the page.
+
+   No inline styles anywhere -- the CSP this UI is served under
+   (src/ro_admin/webui.py) is style-src 'self', so every rule lives here.
+   Every class name below is one a js/*.js module actually sets; grep
+   `class:` and `className` there before removing or renaming one. */
+:root {
+  color-scheme: light dark;
+  --bg: #f7f7f5;
+  --panel: #ffffff;
+  --fg: #1d1d1b;
+  --muted: #6b6b66;
+  --line: #deded8;
+  /* Decorative dividers (--line) fail WCAG 1.4.11's 3:1 non-text contrast
+     on purpose -- they carry no meaning on their own. A control's own
+     boundary is what tells someone where an input or button actually is,
+     so inputs and buttons are outlined with this instead. */
+  --control-line: #8a8a84;
+  --accent: #2f5d9f;
+  --on-accent: #ffffff;
+  --ok: #2e7d32;
+  --warn: #8a5a00;
+  --bad: #b3261e;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141413;
+    --panel: #1d1d1b;
+    --fg: #ecece8;
+    --muted: #a3a39c;
+    --line: #33332f;
+    --control-line: #8f8f89;
+    --accent: #8ab4f8;
+    --on-accent: #141413;
+    --ok: #81c995;
+    --warn: #e3b341;
+    --bad: #f28b82;
+  }
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+/* Every player-chosen string (a character name, an item name, a search
+   query) can be arbitrarily long with no spaces at all. Set here so it
+   applies everywhere by inheritance; also set explicitly on a few classes
+   below whose content is the likeliest to actually be one. */
+#app { max-width: 60rem; margin: 0 auto; padding: 1rem; overflow-wrap: anywhere; }
+
+h1 { font-size: 1.6rem; margin: 0.5rem 0; overflow-wrap: anywhere; }
+h2 { font-size: 1.1rem; margin: 1.5rem 0 0.5rem; }
+h3 { font-size: 1rem; margin: 0; }
+
+input, button { font: inherit; color: inherit; }
+input {
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--control-line);
+  border-radius: 4px;
+  background: var(--panel);
+}
+button {
+  padding: 0.4rem 0.8rem;
+  border: 1px solid var(--control-line);
+  border-radius: 4px;
+  background: var(--panel);
+  cursor: pointer;
+}
+button[type="submit"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+/* Disabled alone is not "busy": actions.js's Retry and Check again buttons
+   disable themselves permanently the instant they are clicked, with no
+   loading state of their own (the outcome text next to them carries that).
+   Only a button actively sending a request -- .busy, toggled at the same
+   moment it is disabled, in actions.js and session.js -- gets the
+   progress cursor; a spent one-shot button gets the ordinary not-allowed. */
+button:disabled { opacity: 0.6; cursor: not-allowed; }
+button.busy:disabled { cursor: progress; }
+
+/* Header (app.js's header()). */
+.bar {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  padding-bottom: 0.75rem;
+  margin-bottom: 1rem;
+  border-bottom: 1px solid var(--line);
+}
+.bar .product { font-weight: 600; }
+.bar .who { margin-left: auto; color: var(--muted); overflow-wrap: anywhere; }
+
+/* The cross-tab notice (app.js's route(), "Now signed in as X, from
+   another tab."): worth noticing, not a problem, so it gets the accent
+   rather than --bad. */
+.notice { color: var(--accent); margin: 0.5rem 0 0; overflow-wrap: anywhere; }
+
+/* The error view app.js draws when a navigation itself fails (app.js's
+   errorView()): a plain stack, the same rhythm as a dossier's sections. */
+.problem-view { display: grid; gap: 0.75rem; margin-top: 1.5rem; }
+
+/* Sign-in (session.js). */
+.login { max-width: 22rem; margin: 3rem auto; display: grid; gap: 0.75rem; }
+label { display: grid; gap: 0.25rem; }
+
+/* Search (search.js). */
+.search input { width: 100%; font-size: 1.1rem; padding: 0.6rem 0.75rem; }
+.status { margin: 0.5rem 0; color: var(--muted); font-size: 0.9em; overflow-wrap: anywhere; }
+.results { margin-top: 0.5rem; }
+.results ul, .account-characters { list-style: none; padding: 0; margin: 0; }
+.results li { margin: 0.25rem 0; }
+.account-characters { margin-left: 1.25rem; }
+.result { width: 100%; text-align: left; overflow-wrap: anywhere; }
+
+.meta, .more, .chosen, .unavailable, .muted, .picker-note {
+  color: var(--muted);
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
+}
+/* A colour alone is not a reliable cue (WCAG 1.4.1): the left border reads
+   as "problem" even to someone who cannot distinguish --bad from --fg. */
+.problem {
+  color: var(--bad);
+  border-left: 3px solid var(--bad);
+  padding-left: 0.5rem;
+  overflow-wrap: anywhere;
+}
+
+/* Dossier (dossier.js): identity, state, inventory and history are all
+   plain sections with the same rhythm; nothing about any one of them needs
+   different spacing from the others. */
+.identity, .state, .actions, .inventory, .history { margin-top: 1.5rem; }
+.identity { margin-top: 0; }
+
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 0; }
+dt { color: var(--muted); }
+dd { margin: 0; overflow-wrap: anywhere; }
+.freshness { display: block; font-size: 0.85em; color: var(--muted); }
+.freshness.stale { color: var(--warn); }
+
+/* Actions (actions.js). */
+.actions h2 { margin-top: 0; margin-bottom: 0; }
+.action {
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  margin-top: 0.75rem;
+}
+.action:first-of-type { margin-top: 0.5rem; }
+
+/* The item picker inside "Give item" (actions.js's itemPicker). */
+.picker { display: grid; gap: 0.4rem; }
+.matches { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+.picker-note.problem { color: var(--bad); }
+
+/* An action's outcome line (actions.js). `pending` is deliberately neutral
+   -- nothing has succeeded or failed yet. `lost-contact` and `stopped`
+   read the same as each other and are styled as warnings, not failures:
+   both mean the write may still run and the operator should check History,
+   never that it is known to have failed. */
+.outcome { font-weight: 500; overflow-wrap: anywhere; }
+.outcome.pending { color: var(--fg); font-weight: 400; }
+.outcome.done { color: var(--ok); }
+.outcome.refused, .outcome.retry, .outcome.stopped, .outcome.lost-contact { color: var(--warn); }
+.outcome.failed { color: var(--bad); }
+
+/* Inventory and history tables/lists (dossier.js). */
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 0.3rem 0.5rem; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.timeline { list-style: none; padding: 0; margin: 0; }
+.timeline li { padding: 0.3rem 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.timeline time { color: var(--muted); font-variant-numeric: tabular-nums; }
+.kind { font-size: 0.8em; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
+.back { margin-bottom: 0.5rem; }
+
+@media (max-width: 40rem) {
+  dl { grid-template-columns: 1fr; }
+  dt { margin-top: 0.5rem; }
+}

@@ -5,13 +5,21 @@ unauthenticated debug blueprint whose create-admin endpoint could mint an
 admin account; a debug surface registered unconditionally will eventually
 ship.
 """
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from ro_admin.config import Settings
 from ro_admin.db import Database
+from ro_admin.webui import UIFiles
 
 from ro_admin.routers import accounts, auth, characters, commands, items, logs, maps, system
+
+# The web UI's files. Shipped inside the package (see pyproject.toml), so a
+# wheel install and the container both carry them, with no build step and no
+# Node at install or run time.
+WEB_DIR = Path(__file__).parent / "web"
 
 app = FastAPI(
     title="ro-admin",
@@ -72,3 +80,29 @@ def healthz() -> JSONResponse:
             content={"status": "unhealthy", "database": f"{type(exc).__name__}"},
         )
     return JSONResponse(status_code=200, content={"status": "ok", "database": "ok"})
+
+
+# Set as the router's fallback, not mounted at "/". A mount fully matches
+# every path itself, so Starlette's router never reaches its OWN 405
+# (wrong method on a real route) or 307 (missing trailing slash) handling
+# for anything under /api/v1 or /healthz -- both silently regressed to a
+# bare 404 under a mount, measured before fixing this (see
+# tests/test_web_ui.py::test_the_api_is_not_shadowed):
+#   GET /api/v1/auth/login   405 Allow: POST  -> 404 under a mount
+#   GET /api/v1/characters/  307              -> 404 under a mount
+#   GET /healthz/            307              -> 404 under a mount
+# Router.default is only invoked after a full match, a method-mismatch
+# partial match, and a slash-redirect have all failed -- exactly the
+# fallback semantics a catch-all UI route needs, and it needs no particular
+# position in this file to get them.
+#
+# The UI is one more client of this API: it reaches the server over HTTP like
+# the CLI and the skill do, which is what makes a privileged UI path
+# impossible rather than merely avoided.
+#
+# Never add a web/404.html. With html=True a request for a file that does
+# not exist falls through to it, so it would be served -- as HTML -- to an
+# API client that mistyped an /api/... path. The UI uses hash routing, so
+# the browser never asks the server for a route that doesn't exist as a
+# real file, and needs no fallback page of its own.
+app.router.default = UIFiles(directory=WEB_DIR, html=True)

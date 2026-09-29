@@ -15,21 +15,28 @@ class Principal:
     scopes: tuple[Permission, ...] | None = None
 
 
-def check_permission(principal: Principal, permission: Permission) -> None:
-    """Raise 403 unless the principal may exercise this permission.
+def is_permitted(principal: Principal, permission: Permission) -> bool:
+    """Whether the principal may exercise this permission.
 
     A scoped principal is checked ONLY against its scopes. Falling back to
     level for a scoped token would let a broadly-privileged minter widen a
     deliberately narrow token.
+
+    The one decision. Enforcement and /auth/me both call it, so what a client
+    is told and what it is allowed cannot disagree.
     """
     permission = Permission(permission)
     if principal.scopes is not None:
-        allowed = permission in principal.scopes
-    else:
-        allowed = principal.level >= required_level(permission)
-    if not allowed:
+        return permission in principal.scopes
+    return principal.level >= required_level(permission)
+
+
+def check_permission(principal: Principal, permission: Permission) -> None:
+    """Raise 403 unless the principal may exercise this permission."""
+    if not is_permitted(principal, permission):
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=f"not permitted: {permission}"
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"not permitted: {Permission(permission)}",
         )
 
 

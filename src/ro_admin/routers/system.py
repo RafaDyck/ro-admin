@@ -27,7 +27,9 @@ from pydantic import BaseModel
 from ro_admin.config import Settings
 from ro_admin.db import Database
 from ro_admin.deps import get_settings, requires
-from ro_admin.overlay import OverlayStatus, read_status, read_tier2_status
+from ro_admin.overlay import (
+    Action, ConsumerTier, OverlayStatus, consumer_tier, read_status, read_tier2_status,
+)
 from ro_admin.permissions import Permission
 from ro_admin.routers.maps import MAPS_NOT_IMPORTED
 
@@ -62,11 +64,21 @@ class Maps(BaseModel):
     imported_at: datetime | None = None
 
 
+class ActionCapability(BaseModel):
+    # The tier whose script consumes this action; its `available` and `reason`
+    # are that tier's, so a client can offer or explain the action without
+    # knowing the mapping itself.
+    tier: ConsumerTier
+    available: bool
+    reason: str
+
+
 class Capabilities(BaseModel):
     tier0: Tier0
     tier1: Tier
     tier2: Tier
     maps: Maps
+    actions: dict[str, ActionCapability]
 
 
 def _maps(db: Database, present: set[str]) -> Maps:
@@ -127,16 +139,29 @@ def capabilities(settings: Settings = Depends(get_settings)) -> Capabilities:
             (settings.db_name,),
         )
     }
+    tiers = {
+        "tier1": _tier(read_status(db)),
+        # Two reads rather than one, because the two tiers have separate
+        # heartbeats -- see overlay/tier2/schema.sql for why that separation is
+        # deliberate. A shared row would make either tier's availability
+        # inferable from the other's age, which is not a thing that is true.
+        "tier2": _tier(read_tier2_status(db)),
+    }
+    # Computed once per action rather than inline in the comprehension below,
+    # where it would otherwise be called three times for the same action.
+    action_tiers: dict[Action, ConsumerTier] = {a: consumer_tier(a) for a in Action}
     return Capabilities(
         tier0=Tier0(
             available=True,
             log_tables=sorted(t for t in KNOWN_LOG_TABLES if t in present),
         ),
-        tier1=_tier(read_status(db)),
-        # Two reads rather than one, because the two tiers have separate
-        # heartbeats -- see overlay/tier2/schema.sql for why that separation is
-        # deliberate. A shared row would make either tier's availability
-        # inferable from the other's age, which is not a thing that is true.
-        tier2=_tier(read_tier2_status(db)),
+        tier1=tiers["tier1"],
+        tier2=tiers["tier2"],
         maps=_maps(db, present),
+        actions={
+            action.value: ActionCapability(
+                tier=tier, available=tiers[tier].available, reason=tiers[tier].reason,
+            )
+            for action, tier in action_tiers.items()
+        },
     )

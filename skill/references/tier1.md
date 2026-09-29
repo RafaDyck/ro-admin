@@ -38,6 +38,23 @@ The `tier1` object on a server that has it, observed:
 }
 ```
 
+Capabilities also answer **per action**, so you never need to know which tier runs
+what:
+
+```json
+"actions": {
+  "give_item":      {"tier": "tier1", "available": true,  "reason": "overlay responding, last seen 0s ago"},
+  "adjust_zeny":    {"tier": "tier1", "available": true,  "reason": "overlay responding, last seen 0s ago"},
+  "sync_character": {"tier": "tier2", "available": false, "reason": "tier 2 not installed: run overlay/tier2/schema.sql against this database, then follow overlay/tier2/README.md to compile the hook"}
+}
+```
+
+This is the common install: Tier 1 running, Tier 2 not. The Tier 1 reasons were
+observed on the reference lab; the Tier 2 reason is copied byte for byte from
+`TIER2.not_installed` in `src/ro_admin/overlay.py`, which is what the API returns for
+an install in this state. `actions.<name>.reason` is the consuming tier's own reason,
+and follows the same rule below.
+
 If `available` is false, **relay `reason` to the operator verbatim and stop.** It is
 written to name their next step, and it is the only thing you know. Real examples:
 
@@ -365,7 +382,11 @@ Observed, for the first of those:
 
 After `executed`, re-read the character. `synced_at` carries the moment the stored row
 was **observed** to match the game's memory, and `stale` is false while that
-observation is under a minute old.
+observation is under a minute old AND no queued write has been attempted since
+(processing, executed or failed) — a `give_item` or `adjust_zeny` that reaches any of
+those statuses after the sync reopens `stale` even though `synced_at` itself is still
+recent, because the sync proves what the row looked like at that moment, not what it
+looks like now. `references/entities.md` has the full rule.
 
 **It is evidence about the `char` row and not about the inventory.**
 `GET /characters/{char_id}/inventory` still reports `stale: true` for an online

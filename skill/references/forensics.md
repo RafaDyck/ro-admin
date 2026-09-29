@@ -12,17 +12,41 @@ apply here unchanged; these are the ones specific to the log surface.
 python -m ro_admin.cli get logs/timeline char_id=150002
 ```
 
-It merges GM commands, zeny changes, and item transactions into one chronological
-stream, each entry carrying a readable `summary` plus a `detail` object:
+It merges GM commands, zeny changes, item transactions, and — where Tier 1 or Tier 2
+is installed — this character's own rows from the action queue into one chronological
+stream, each entry carrying a readable `summary` plus a `detail` object.
+
+Observed on the reference lab's character 150002, `limit=3` (its zeny and queue history
+crowd out the item entry below at this limit; both are real, separate observations, not
+one screenshot):
 
 ```
-2026-08-22T03:37:56  [item]  item 501 x3 via npc script on geffen
-2026-08-21T22:29:54  [zeny]  zeny +777 via admin command on geffen
+2026-09-26T20:14:52  [zeny]    zeny +1289 via admin command on geffen
+2026-09-26T20:14:52  [queued]  adjust_zeny +1289 requested by admin1234: executed
+2026-09-26T20:14:47  [zeny]    zeny +511 via admin command on geffen
 ```
+
+And, further back for the same character:
+
+```
+2026-08-22T03:37:56  [item]    Red Potion x3 via npc script on geffen
+```
+
+**The `queued` entries matter more than they look.** On a stock rAthena, `adjust_zeny`
+leaves no `zenylog` row at all — `log_zeny` ships off (see `references/tier1.md`) — so
+the queue is the only durable record that request ever happened. If you are asked
+whether a write was already sent before sending it again, this is what you check, and
+`kind: "zeny"` alone is not enough to rule it out. `sync_character` rows appear here too,
+same as any other queued action.
+
+Check `sources` on the response before concluding the queue was consulted: it lists only
+the tables actually read, so `"ro_admin_commands"` is present only when Tier 1 or Tier 2
+is installed. Absent from `sources`, the honest reading is "this server has no queue to
+check", not "nothing was queued".
 
 Prefer the timeline for open-ended investigation, and the per-source endpoints
-(`logs/zeny`, `logs/items`, `logs/commands`) when you already know what you are
-looking for or need filters they offer.
+(`logs/zeny`, `logs/items`, `logs/commands`, `commands/{id}`) when you already know what
+you are looking for or need filters they offer.
 
 ## Reading the results honestly
 

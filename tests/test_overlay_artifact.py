@@ -312,6 +312,39 @@ def test_tier2_artifact_exists(tier2_source):
     assert tier2_source, "overlay/tier2/ro_admin_tier2.txt is empty or missing"
 
 
+def test_ui_error_matching_depends_on_this_exact_wording(source, tier2_source):
+    """The web UI's actions.js has no view of these scripts at all -- it only
+    ever sees `error_message` off a command row, and classifies a failed
+    write by matching that string against two regexes in its
+    `describeOutcome` (src/ro_admin/web/js/actions.js): `/not online/` reads
+    a failure as a refusal ("Not applied: ..."), and, for a `sync_character`
+    row specifically, `/not yet persisted/` reads it as an expected
+    first-sync retry that offers a Retry button.
+
+    Those patterns are meaningless unless the overlay scripts actually write
+    text that matches them. Both scripts write "character is not online"
+    (Tier 1's own .@err$, and Tier 2's -- a sync can fail the same way a
+    write can); only Tier 2 writes "flush queued but not yet persisted -
+    retry", since only sync_character has a first-write-not-committed-yet
+    case. This pins the exact wording on the script side, so a rename here
+    fails this test loudly instead of silently breaking the UI's
+    classification.
+    """
+    assert "character is not online" in source, (
+        "overlay/ro_admin_overlay.txt no longer writes the exact wording "
+        "actions.js's describeOutcome matches with /not online/"
+    )
+    assert "character is not online" in tier2_source, (
+        "overlay/tier2/ro_admin_tier2.txt no longer writes the exact wording "
+        "actions.js's describeOutcome matches with /not online/"
+    )
+    assert "flush queued but not yet persisted - retry" in tier2_source, (
+        "overlay/tier2/ro_admin_tier2.txt no longer writes the exact wording "
+        "actions.js's describeOutcome matches with /not yet persisted/ to "
+        "offer a Retry on a sync_character row"
+    )
+
+
 def test_tier2_concatenates_no_string_variable_into_sql(tier2_source):
     offenders = _sql_string_offenders(tier2_source)
     assert not offenders, f"string variable concatenated into SQL: {offenders}"

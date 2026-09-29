@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "ro-admin"
 version = "0.1.0"
@@ -26,3 +30,10 @@ testpaths = ["tests"]
 # Without it, bare `pytest` fails to import importers.* while `python -m pytest`
 # succeeds, because only the latter prepends the working directory to sys.path.
 pythonpath = [".", "src"]
+
+[tool.setuptools.package-data]
+# The web UI ships inside the package, so `pip install ro-admin` and the
+# container carry it with no build step and no Node. Every file under
+# src/ro_admin/web/ must match a pattern here: scripts/check_wheel_ships_web.py
+# fails the build when one does not.
+ro_admin = ["web/index.html", "web/*.css", "web/js/*.js"]

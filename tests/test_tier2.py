@@ -18,7 +18,7 @@ install with no Tier 2 TABLES answers every character endpoint exactly as it did
 before this feature existed -- which cannot be shown by dropping the tables,
 because the lab is shared and the rest of the suite reads them.
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pymysql
 import pytest
@@ -29,10 +29,10 @@ from conftest import (
     apply_test_env,
 )
 from ro_admin.auth import issue_service_token
-from ro_admin.overlay import SYNC_TABLE, Action
+from ro_admin.overlay import COMMAND_TABLE, SYNC_TABLE, Action
 from ro_admin.permissions import Permission
 from ro_admin.projections import CHARACTER_COLUMNS
-from ro_admin.routers.characters import _to_character
+from ro_admin.routers.characters import _missing_table_names, _to_character
 
 
 @pytest.fixture()
@@ -501,6 +501,138 @@ def test_a_sql_error_that_is_not_a_missing_table_is_still_a_500(
     monkeypatch.setattr("ro_admin.db.Database.query", unknown_column)
     with pytest.raises(pymysql.err.ProgrammingError):
         client.get(f"/api/v1/characters/{CHAR_ID}", headers=reader_headers)
+
+
+# ---------------------------------------------------------------------------
+# I-4's middle fallback: ro_admin_sync present, ro_admin_commands missing --
+# the mirror image of `without_tier2` above. A real, supported shape (a
+# hand-built or partial Tier 2 install with no command queue at all), and the
+# one _select_characters' three-stage retry exists to answer correctly:
+# written_at must be unavailable, but synced_at and the `stale` it derives
+# must be completely unaffected. Faked the same way as `without_tier2`, for
+# the same reason -- dropping ro_admin_commands for real would break every
+# other test in this file that reads it.
+# ---------------------------------------------------------------------------
+
+_SYNC_NOW = datetime(2026, 1, 1, 12, 0, 0)
+_SYNC_RECENT = _SYNC_NOW - timedelta(seconds=2)
+
+
+@pytest.fixture()
+def without_commands_table(client, monkeypatch) -> list[str]:
+    """ro_admin_sync has a fresh sync for CHAR_ID; ro_admin_commands is
+    missing entirely."""
+    statements: list[str] = []
+
+    def query(self, sql, params=None):
+        statements.append(sql)
+        if COMMAND_TABLE in sql:
+            raise pymysql.err.ProgrammingError(
+                1146, f"Table 'ragnarok.{COMMAND_TABLE}' doesn't exist"
+            )
+        if "FROM `char`" in sql:
+            row = dict(_ROW)
+            row["synced_at"] = _SYNC_RECENT
+            row["db_now"] = _SYNC_NOW
+            return [row]
+        if "FROM login" in sql:
+            return [{"account_id": ACCOUNT_ID}]
+        return []
+
+    monkeypatch.setattr("ro_admin.db.Database.query", query)
+    return statements
+
+
+def test_a_missing_commands_table_still_reports_synced_at_and_derives_stale(
+    client, without_commands_table, reader_headers
+):
+    """A missing command queue must not erase ro_admin_sync's unrelated
+    evidence -- the whole reason _select_characters skips only ONE stage of
+    its retry (sync_only) rather than falling straight to the plain query."""
+    body = client.get(
+        f"/api/v1/characters/{CHAR_ID}", headers=reader_headers
+    ).json()
+    assert body["synced_at"] is not None, (
+        "a missing ro_admin_commands must not also erase ro_admin_sync's evidence"
+    )
+    assert body["stale"] is False, (
+        "stale must still be derived from the sync when written_at is unavailable "
+        "-- online, synced 2s ago, no known write"
+    )
+    assert body["stale_fields"] == []
+
+
+def test_a_missing_commands_table_the_sync_only_fallback_actually_ran(
+    client, without_commands_table, reader_headers
+):
+    """Guards the test above from passing for the wrong reason: if the
+    with-written_at statement were never attempted, or the sync-only fallback
+    were skipped straight to the plain query, the assertions above would
+    still hold by accident."""
+    client.get(f"/api/v1/characters/{CHAR_ID}", headers=reader_headers)
+    statements = without_commands_table
+    assert any(COMMAND_TABLE in s for s in statements), (
+        "the with-written_at statement referencing ro_admin_commands was never attempted"
+    )
+    assert any(
+        SYNC_TABLE in s and COMMAND_TABLE not in s for s in statements
+    ), "the sync-only fallback (sync join intact, no written_at subquery) never ran"
+
+
+# ---------------------------------------------------------------------------
+# _missing_table_names must match the NAMED table, not merely a database or
+# table whose name happens to contain it as a substring.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "message, table, expected",
+    [
+        (f"Table 'ragnarok.{SYNC_TABLE}' doesn't exist", SYNC_TABLE, True),
+        (f"Table 'ragnarok.{COMMAND_TABLE}' doesn't exist", COMMAND_TABLE, True),
+        # A table (or database) name that merely CONTAINS the target name as
+        # a substring must NOT match: ragnarok.ro_admin_sync_test genuinely
+        # contains "ro_admin_sync", and the old bare `in` check would wrongly
+        # treat a missing ro_admin_sync_test as if it were ro_admin_sync
+        # itself -- skipping the sync-only retry over a table this install
+        # was never missing.
+        (f"Table 'ragnarok.{SYNC_TABLE}_test' doesn't exist", SYNC_TABLE, False),
+        (f"Table 'ragnarok_test.{COMMAND_TABLE}' doesn't exist", COMMAND_TABLE, True),
+        (f"Table 'ragnarok.{SYNC_TABLE}' doesn't exist", COMMAND_TABLE, False),
+    ],
+)
+def test_missing_table_names_matches_the_named_table_not_a_prefix(
+    message, table, expected
+):
+    exc = pymysql.err.ProgrammingError(1146, message)
+    assert _missing_table_names(exc, table) is expected
+
+
+def test_a_missing_sync_table_skips_the_sync_only_stage_entirely(
+    client, without_tier2, reader_headers
+):
+    """The M-2 skip, pinned at the statement level rather than the final
+    response: when the 1146 names ro_admin_sync itself, retrying the
+    sync-only statement (which still joins ro_admin_sync) is guaranteed to
+    fail the identical way a second time, so _select_characters must go
+    straight to the plain query instead of wasting a round trip trying it.
+
+    A regression that added the wasted middle attempt back would still pass
+    every other test in this file -- they only check that SOME plain
+    fallback eventually ran, not how many statements it took to get there.
+    """
+    client.get(f"/api/v1/characters/{CHAR_ID}", headers=reader_headers)
+    assert len(without_tier2) == 2, (
+        f"expected exactly two statements (with_written_at, then plain), "
+        f"got {len(without_tier2)}: {without_tier2}"
+    )
+    with_written_at, plain = without_tier2
+    assert SYNC_TABLE in with_written_at
+    assert SYNC_TABLE not in plain, (
+        "a sync-only statement ran between the failed with_written_at "
+        "attempt and the plain fallback -- the ro_admin_sync-missing skip "
+        "in _select_characters is not taking effect"
+    )
 
 
 def test_the_openapi_document_describes_what_synced_at_covers(client):

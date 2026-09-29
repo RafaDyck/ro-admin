@@ -106,3 +106,77 @@ def test_the_existing_callers_keep_working_without_the_new_arguments():
     character = _to_character(_row(online=1))
     assert character.stale is True
     assert character.synced_at is None
+
+
+# ---------------------------------------------------------------------------
+# Fix A: a write executed after the last verified sync reopens staleness.
+#
+# A queued give_item/adjust_zeny that finished AFTER synced_at means the
+# stored row moved again after the sync observed it -- the sync no longer
+# vouches for what is in the row now. This is the founding incident in
+# reverse: an operator seeing "verified at T" beside a pre-change zeny, right
+# next to "executed", would conclude the command did not take.
+# ---------------------------------------------------------------------------
+
+
+def test_recent_sync_with_no_known_write_is_still_fresh():
+    """written_at defaults to None -- 'no known write' -- and must not itself
+    manufacture staleness. Same case test_an_online_character_synced_just_now
+    _is_not_stale above covers implicitly; asserted explicitly here as the
+    written_at=None baseline the rest of this section is measured against."""
+    now = datetime(2026, 9, 26, 12, 0, 0)
+    character = _to_character(
+        _row(online=1), synced_at=now - timedelta(seconds=2), now=now,
+        written_at=None,
+    )
+    assert character.stale is False
+
+
+def test_recent_sync_with_a_write_before_it_is_still_fresh():
+    """The write is old news -- the sync happened after it and is still
+    evidence about the row's current contents."""
+    now = datetime(2026, 9, 26, 12, 0, 0)
+    synced_at = now - timedelta(seconds=2)
+    written_at = synced_at - timedelta(seconds=5)
+    character = _to_character(
+        _row(online=1), synced_at=synced_at, now=now, written_at=written_at,
+    )
+    assert character.stale is False
+
+
+def test_a_write_executed_after_the_sync_reopens_staleness():
+    """The regression this fix exists to catch: a queued write that landed
+    after the sync means the row is behind the game again, even though the
+    sync itself is still inside FRESH_WITHIN_SECONDS."""
+    now = datetime(2026, 9, 26, 12, 0, 0)
+    synced_at = now - timedelta(seconds=2)
+    written_at = synced_at + timedelta(seconds=1)
+    character = _to_character(
+        _row(online=1), synced_at=synced_at, now=now, written_at=written_at,
+    )
+    assert character.stale is True
+    assert character.synced_at is not None, "still report WHEN, even when stale"
+
+
+def test_a_sync_in_the_same_second_as_a_write_is_ambiguous_and_stays_stale():
+    """Equal timestamps cannot say which happened first, and staying stale is
+    the safe answer -- so the comparison is a strict `>`, not `>=`."""
+    now = datetime(2026, 9, 26, 12, 0, 0)
+    synced_at = now - timedelta(seconds=2)
+    character = _to_character(
+        _row(online=1), synced_at=synced_at, now=now, written_at=synced_at,
+    )
+    assert character.stale is True
+
+
+def test_an_offline_character_ignores_a_later_write():
+    """Offline is never stale regardless of sync evidence -- a later write
+    must not change that either."""
+    now = datetime(2026, 9, 26, 12, 0, 0)
+    synced_at = now - timedelta(seconds=2)
+    written_at = synced_at + timedelta(seconds=1)
+    character = _to_character(
+        _row(online=0), synced_at=synced_at, now=now, written_at=written_at,
+    )
+    assert character.stale is False
+    assert character.stale_fields == []

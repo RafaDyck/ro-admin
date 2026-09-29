@@ -32,7 +32,28 @@ CREATE TABLE IF NOT EXISTS `ro_admin_commands` (
   `finished_at`   DATETIME     DEFAULT NULL,
   `error_message` VARCHAR(255) DEFAULT NULL,
   PRIMARY KEY (`id`),
-  KEY `idx_status_id` (`status`, `id`)
+  KEY `idx_status_id` (`status`, `id`),
+  -- Serves the per-character command-queue rows in GET /logs/timeline
+  -- (ORDER BY id), and is what _select_characters' write-evidence subquery
+  -- falls back to being able to use at all. Without it, either is a full
+  -- table scan per character, on every request.
+  KEY `idx_char_id` (`char_id`, `id`),
+  -- The write-evidence subquery behind `stale` itself
+  -- (src/ro_admin/routers/characters.py's written_at_sql) needs more than
+  -- idx_char_id above serves. Measured in this project's own lab, where one
+  -- character's rows happen to dominate the table (86% of 1,402 rows belong
+  -- to one char_id): EXPLAIN ANALYZE on idx_char_id reads every one of that
+  -- character's rows through a non-covering index lookup, then filters
+  -- status/action against the base row (~1ms observed). This index -- which
+  -- carries every column that subquery reads -- lets MySQL answer it as a
+  -- covering range scan with no base-row reads at all (~0.4ms observed in
+  -- the same lab, and the gap only widens as the table grows, since it is
+  -- the base-row I/O that scales with row count, not an index-only scan).
+  -- Column order: char_id first (the equality filter), then status and
+  -- action (also filtered, and needed in the index for the scan to stay
+  -- covering), then the two timestamp columns the subquery actually
+  -- aggregates.
+  KEY `idx_char_status` (`char_id`, `status`, `action`, `finished_at`, `claimed_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Single-row heartbeat, rewritten by the NPC on every poll.

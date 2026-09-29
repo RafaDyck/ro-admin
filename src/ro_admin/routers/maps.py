@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from ro_admin.config import Settings
 from ro_admin.db import Database
 from ro_admin.deps import get_settings, requires
+from ro_admin.like import like_literal
 from ro_admin.permissions import Permission
 
 router = APIRouter(prefix="/api/v1/maps", tags=["maps"])
@@ -120,15 +121,6 @@ class Cell(BaseModel):
     water: bool
 
 
-def _like_literal(text: str) -> str:
-    """Escape a search term for use inside a LIKE pattern.
-
-    Parameterisation stops injection; it does not stop `%` and `_` being read
-    as wildcards. Same escape as the item search, for the same reason.
-    """
-    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
 def _load_grid(db: Database, name: str) -> tuple[bytes, int, int]:
     """Fetch and decompress one map's cells, or 404."""
     rows = _query(
@@ -169,7 +161,7 @@ def list_maps(
     where, params = "", []
     if q is not None:
         where = "WHERE name LIKE %s ESCAPE '\\\\'"
-        params.append(f"%{_like_literal(q)}%")
+        params.append(f"%{like_literal(q)}%")
 
     total = _query(db, f"SELECT COUNT(*) AS n FROM ro_admin_maps {where}", params)[0]["n"]
     rows = _query(

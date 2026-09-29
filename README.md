@@ -6,7 +6,8 @@ A modern administration API for [rAthena](https://github.com/rathena/rathena) se
 
 **Is:** an operator's administration API — **forensics** over rAthena's own logs and **live GM
 operations** applied inside the running game server. Eight routers ship today: `auth`, `logs`
-(GM commands, zeny changes, item transactions, and a per-character timeline across all three),
+(GM commands, zeny changes, item transactions, and a per-character timeline across all
+three plus the Tier 1/2 action queue),
 `system` (capability reporting), `items` (search, type facets and full item detail
 including the rAthena script), `accounts` and `characters`
 (reads over the `login` and `char` tables, including a character's inventory), `maps`
@@ -20,15 +21,15 @@ including the rAthena script), `accounts` and `characters`
 | `GET /api/v1/logs/commands` | GM commands (`atcommandlog`) |
 | `GET /api/v1/logs/zeny` | Zeny changes (`zenylog`) |
 | `GET /api/v1/logs/items` | Item transactions (`picklog`) |
-| `GET /api/v1/logs/timeline` | All three merged per character, chronologically |
+| `GET /api/v1/logs/timeline` | All three merged per character, chronologically, plus this character's own rows from the action queue where Tier 1/2 is installed |
 | `GET /api/v1/system/capabilities` | Which tiers and log tables this install actually has |
 | `GET /api/v1/items` | Search the operator's own `item_db`: `q` (substring of `name_english`, `name_aegis` or `alias_name`), `type`, `subtype`, `slots`; `limit`/`offset` |
 | `GET /api/v1/items/types` | The item types this server actually has, with counts |
 | `GET /api/v1/items/{item_id}` | One item in full — names, stats, prices and its rAthena `script` |
-| `GET /api/v1/accounts` | Filters: `userid` (exact), `min_group_id`; `limit`/`offset` |
+| `GET /api/v1/accounts` | Filters: `userid` (exact), `userid_prefix` (from the start, index-backed), `min_group_id`; `limit`/`offset`; reports `has_more`, not a total |
 | `GET /api/v1/accounts/{account_id}` | One account |
 | `GET /api/v1/accounts/{account_id}/characters` | That account's characters |
-| `GET /api/v1/characters` | Filters: `name` (exact), `account_id`, `online`; `limit`/`offset` |
+| `GET /api/v1/characters` | Filters: `name` (exact), `name_prefix` (from the start, index-backed), `account_id`, `online`; `limit`/`offset`; reports `has_more`, not a total |
 | `GET /api/v1/characters/{char_id}` | One character, with `stale`, `stale_fields` and `synced_at` |
 | `GET /api/v1/characters/{char_id}/inventory` | Inventory, item names resolved server-side |
 | `GET /api/v1/maps` | Search the imported map list: `q` (substring of the name); `limit`/`offset` |
@@ -47,9 +48,11 @@ Because the `char` table is a mirror the map server flushes on logout or every
 `autosave_time`, every character response carries `stale`, `stale_fields` and
 `synced_at` saying so. **`stale` is not a restatement of `online`.** On a Tier 2 install
 `synced_at` is the moment the stored row was *observed* to match the game's live memory,
-and `stale` is false while that observation is under a minute old — evidence rather than
-an assumption. It covers the `char` row and not the inventory, which reports its own
-staleness from `online` alone.
+and `stale` is false while that observation is under a minute old *and* no Tier 1 write
+(`give_item`, `adjust_zeny`) has been attempted since (processing, executed or failed) —
+such a write reopens `stale` even though `synced_at` is still recent, because the sync
+only proves what the row looked like at that moment. It covers the `char` row and not
+the inventory, which reports its own staleness from `online` alone.
 
 **Is not:** a FluxCP replacement. FluxCP is two products: of its 135 actions, only 49 require
 admin. The other 64% is a player-facing control panel — registration, rankings, donations,
@@ -160,7 +163,25 @@ revocation list — a token is valid until it expires, so `--days` is the contro
     pip install -e ".[dev]"
     uvicorn ro_admin.main:app --reload
 
-API docs at http://localhost:8000/docs
+The web UI is at http://localhost:8000/ and the API docs at
+http://localhost:8000/docs.
+
+The UI's unit tests need Node 22.13+ or 24, for development only:
+
+    npm ci && npm test
+
+## Web UI
+
+The server that runs the API also serves a web UI at `/`. Sign in with an rAthena
+account, find a character by the start of their name (or an account by the start of its
+userid, or either by id), and open a dossier: who they are, their current state and how
+fresh it is, their inventory, and what has happened to them. Accounts that may write
+also get the actions this install supports, each offered only when the API reports it
+would accept it.
+
+It is plain HTML, CSS and JavaScript shipped inside the Python package. There is no
+build step, and no Node is needed to install or run it. It is one more client of the
+API, so it can do nothing the API would refuse.
 
 ## Relationship to rAthena
 

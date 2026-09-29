@@ -32,3 +32,21 @@ jobs:
         # parameter otherwise makes it silently wrong, and nothing reads it
         # before it acts.
         run: python scripts/check_skill_matches_api.py
+      - name: No HTML parsing in the web UI
+        # Player-chosen names are rendered by the UI. One of them parsed as
+        # HTML runs inside an admin's session. js/dom.js builds only text.
+        run: python scripts/check_no_innerhtml.py
+      - name: The wheel ships the web UI
+        # Served from the source tree in development, so a file missing from
+        # package data only shows up as a blank page after `pip install`.
+        run: |
+          pip wheel . --no-deps -w dist
+          python scripts/check_wheel_ships_web.py dist
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Web UI unit tests
+        # Node is a development dependency only. Nothing it installs ships:
+        # the UI is plain files, and ro-admin runs with Python alone.
+        run: npm ci && npm test

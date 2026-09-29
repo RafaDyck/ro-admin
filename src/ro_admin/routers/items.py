@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from ro_admin.config import Settings
 from ro_admin.db import Database
 from ro_admin.deps import get_settings, requires
+from ro_admin.like import like_literal
 from ro_admin.permissions import Permission
 from ro_admin.projections import (
     ITEM_DETAIL_COLUMNS,
@@ -92,19 +93,6 @@ class ItemTypes(BaseModel):
     types: list[ItemTypeCount]
 
 
-def _like_literal(text: str) -> str:
-    """Escape a user's search text for use inside a LIKE pattern.
-
-    Parameterisation stops injection; it does NOT stop `%` and `_` being read
-    as wildcards. Without this, searching for "50%" matches every item
-    beginning "50" and searching for "%" matches the whole table -- a query
-    that looks safe, is safe, and quietly returns nonsense.
-
-    The backslash must be escaped first, or it would escape the escapes.
-    """
-    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
 def lookup_names(db: Database, item_ids: list[int]) -> dict[int, str]:
     """Resolve many ids at once.
 
@@ -148,7 +136,7 @@ def search_items(
     db = Database(settings)
     clauses, params = [], []
     if q is not None:
-        pattern = f"%{_like_literal(q)}%"
+        pattern = f"%{like_literal(q)}%"
         clauses.append(
             "(name_english LIKE %s ESCAPE '\\\\' OR name_aegis LIKE %s ESCAPE '\\\\' "
             "OR alias_name LIKE %s ESCAPE '\\\\')"

@@ -5,8 +5,8 @@ from pydantic import BaseModel
 from ro_admin.auth import issue_token, verify_password
 from ro_admin.config import Settings
 from ro_admin.db import Database
-from ro_admin.deps import Principal, current_principal, get_settings
-from ro_admin.permissions import Level
+from ro_admin.deps import Principal, current_principal, get_settings, is_permitted
+from ro_admin.permissions import ALL_PERMISSIONS, Level, Permission
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
@@ -42,8 +42,23 @@ def login(body: LoginRequest, settings: Settings = Depends(get_settings)) -> Log
 class MeResponse(BaseModel):
     subject: str
     level: int
+    # Typed as the enum itself, not bare str: a permission string that is not
+    # a real Permission (from a typo in some future edit here) is then a
+    # validation error at response time, not a value a client silently
+    # receives.
+    permissions: list[Permission]
 
 
 @router.get("/me", response_model=MeResponse, summary="The authenticated principal")
 def me(principal: Principal = Depends(current_principal)) -> MeResponse:
-    return MeResponse(subject=principal.subject, level=int(principal.level))
+    """Who you are, and exactly what you may do.
+
+    `permissions` is computed by the function that enforces them, so a client
+    can decide what to offer without keeping its own copy of the permission
+    table.
+    """
+    return MeResponse(
+        subject=principal.subject,
+        level=int(principal.level),
+        permissions=[p for p in ALL_PERMISSIONS if is_permitted(principal, p)],
+    )
