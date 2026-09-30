@@ -13,6 +13,9 @@ Defaults target the reference lab so `pytest` works out of the box there.
 Override with RO_ADMIN_TEST_* to point the suite at your own install.
 """
 import os
+import time
+
+import pytest
 
 # Accounts the integration tests authenticate as. The admin account needs
 # group_id >= 10; the player account must be group_id 0, because several tests
@@ -45,3 +48,88 @@ def apply_test_env(monkeypatch) -> None:
     monkeypatch.setenv("RO_ADMIN_DB_USER", DB_USER)
     monkeypatch.setenv("RO_ADMIN_DB_PASSWORD", DB_PASSWORD)
     monkeypatch.setenv("RO_ADMIN_DB_PORT", DB_PORT)
+
+
+# --- queue rows the suite leaves behind ---------------------------------------
+#
+# Several integration tests queue real commands, mostly against a character
+# who is offline, and the overlay refuses them as `failed: character is not
+# online`. Nothing in the game changes, but every run used to leave its rows
+# behind: the lab reached 1,517 of them, and they crowded real events out of
+# the character's History and out of the timeline tests' windows.
+#
+# The rows can't be avoided -- the tests assert that the queue records the
+# signed-in user, so they must go through the real enqueue -- so they are
+# recorded as they are created and deleted when the session ends.
+#
+# Deleted: only rows that provably changed nothing. That means still
+# `pending` (never claimed, so never run), or `failed` with "character is not
+# online". A row that executed, or failed any other way, may have touched
+# the game and is left alone as the record of that. Each DELETE is one atomic
+# statement, so a row the overlay claims in between is `processing` by then
+# and is skipped rather than deleted mid-run.
+
+_queued_by_tests: list[int] = []
+
+# How long to let the overlay finish rows still processing when the session
+# ends. It polls every second, and a refusal is immediate once claimed.
+_SETTLE_SECONDS = 5.0
+
+
+@pytest.fixture(autouse=True)
+def _record_queued_commands(monkeypatch):
+    """Note the id of every row a test enqueues through the router."""
+    from ro_admin.routers import commands
+
+    real_enqueue = commands.enqueue
+
+    def recording_enqueue(*args, **kwargs):
+        new_id = real_enqueue(*args, **kwargs)
+        _queued_by_tests.append(new_id)
+        return new_id
+
+    monkeypatch.setattr(commands, "enqueue", recording_enqueue)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if not _queued_by_tests:
+        return
+    import pymysql
+
+    try:
+        _delete_rows_that_changed_nothing(sorted(set(_queued_by_tests)))
+    except pymysql.err.OperationalError as exc:
+        # No database to clean. A test that enqueued against a faked one
+        # left nothing real behind, and cleanup must never fail the run.
+        print(f"\nqueue cleanup skipped: {exc.args[-1] if exc.args else exc}")
+
+
+def _delete_rows_that_changed_nothing(ids: list[int]) -> None:
+    from ro_admin.config import Settings
+    from ro_admin.db import Database
+
+    db = Database(Settings(
+        jwt_secret=TEST_JWT_SECRET, db_user=DB_USER,
+        db_password=DB_PASSWORD, db_port=int(DB_PORT),
+    ))
+    marks = ",".join(["%s"] * len(ids))
+
+    deadline = time.monotonic() + _SETTLE_SECONDS
+    while time.monotonic() < deadline:
+        busy = db.query(
+            f"SELECT COUNT(*) AS n FROM ro_admin_commands "
+            f"WHERE id IN ({marks}) AND status = 'processing'",
+            ids,
+        )[0]["n"]
+        if not busy:
+            break
+        time.sleep(0.5)
+
+    # `requested_by` as well as the id, so that an id a faked enqueue made up
+    # can only ever match a row this suite's own account queued.
+    db.execute(
+        f"DELETE FROM ro_admin_commands WHERE id IN ({marks}) "
+        f"AND requested_by = %s AND (status = 'pending' OR "
+        f"(status = 'failed' AND error_message = 'character is not online'))",
+        [*ids, ADMIN_USER],
+    )
